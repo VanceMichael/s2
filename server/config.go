@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -43,6 +44,7 @@ const (
 	EnvS2ServerUser            = "S2_SERVER_USER"
 	EnvS2ServerPassword        = "S2_SERVER_PASSWORD" // #nosec G101 -- env var name, not a credential
 	EnvS2ServerBuckets         = "S2_SERVER_BUCKETS"
+	EnvS2ServerS3Domain        = "S2_SERVER_S3_DOMAIN"
 )
 
 // Config is a configuration for the server.
@@ -59,9 +61,20 @@ type Config struct {
 	// the S3 listener. Its first path segment is reserved and cannot be
 	// used as a bucket name (Buckets.Create returns ErrReservedBucketName
 	// for that name). The default "/healthz" reserves the bucket name
-	// "healthz". Must start with "/" and have at least one segment after
-	// it. Set to an empty string to disable the health endpoint entirely.
+	// must start with "/" and have at least one segment after it. Set to an
+	// empty string to disable the health endpoint entirely.
 	HealthPath string `json:"health_path"`
+	// S3Domain optionally enables virtual-host-style bucket addressing on
+	// the S3 listener: a request to "<bucket>.<S3Domain>:<port>/<key>" is
+	// routed with the Host-derived bucket and the wire path as the key, for
+	// every bucket, object, copy and multipart operation. The bare domain's
+	// root keeps serving ListBuckets and the health endpoint. The value is
+	// normalized to a lowercased DNS name (scheme, port, path and a single
+	// FQDN trailing dot are stripped). Empty (the default) disables the
+	// feature entirely and all requests keep path-style behaviour; Hosts
+	// that target the domain with a trailing dot or an illegal bucket label
+	// are rejected with 400 instead of being reinterpreted as path-style.
+	S3Domain string `json:"s3_domain"`
 	// MaxUploadSize is the maximum upload size in bytes. When 0, a backend-specific
 	// default is used (see EffectiveMaxUploadSize): 5 GiB for osfs/s3, 16 MiB for
 	// memfs. The conservative memfs default protects the host from accidental
@@ -156,6 +169,14 @@ func (cfg *Config) Validate() error {
 		if cfg.HealthPath == "/" {
 			return fmt.Errorf("server: HealthPath %q must have at least one path segment", cfg.HealthPath)
 		}
+	}
+
+	if cfg.S3Domain != "" {
+		d, err := normalizeS3Domain(cfg.S3Domain)
+		if err != nil {
+			return fmt.Errorf("server: S3Domain: %w", err)
+		}
+		cfg.S3Domain = d
 	}
 
 	if cfg.User == AnonymousAccessKeyID {
@@ -276,6 +297,9 @@ func (cfg *Config) LoadEnv() error {
 	if v, ok := os.LookupEnv(EnvS2ServerHealthPath); ok {
 		cfg.HealthPath = v
 	}
+	if v, ok := os.LookupEnv(EnvS2ServerS3Domain); ok {
+		cfg.S3Domain = v
+	}
 	if typ := os.Getenv(EnvS2ServerType); typ != "" {
 		cfg.Type = s2.Type(typ)
 	}
@@ -313,4 +337,48 @@ func (cfg *Config) LoadEnv() error {
 		cfg.Buckets = splitBucketList(v)
 	}
 	return nil
+}
+
+// normalizeS3Domain normalizes a configured service domain to a plain
+// lowercased DNS name. It accepts the common pasted forms -- an
+// "http(s)://" URL with a path, a port, and a single FQDN trailing dot --
+// because scheme/port belong to the listener and the trailing dot is
+// conventional spelling; the wire Host header itself is never normalized
+// (its trailing dot is rejected by matchBucketHost). Each label must be
+// non-empty, at most 63 characters of [a-z0-9-], and not start or end
+// with a hyphen.
+func normalizeS3Domain(in string) (string, error) {
+	d := strings.ToLower(strings.TrimSpace(in))
+	for _, scheme := range []string{"https://", "http://"} {
+		d = strings.TrimPrefix(d, scheme)
+	}
+	// Keep the host portion of any pasted URL only.
+	if i := strings.IndexAny(d, "/?#"); i >= 0 {
+		d = d[:i]
+	}
+	// A port in the config is meaningless; the listener owns it.
+	if name, _, err := net.SplitHostPort(d); err == nil {
+		d = name
+	}
+	d = strings.TrimSuffix(d, ".")
+	if d == "" {
+		return "", fmt.Errorf("must not be empty")
+	}
+	for _, label := range strings.Split(d, ".") {
+		switch {
+		case label == "":
+			return "", fmt.Errorf("empty DNS label in %q", in)
+		case len(label) > 63:
+			return "", fmt.Errorf("DNS label %q is longer than 63 characters", label)
+		case strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-"):
+			return "", fmt.Errorf("DNS label %q must not start or end with a hyphen", label)
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+				return "", fmt.Errorf("DNS label %q contains illegal character %q", label, c)
+			}
+		}
+	}
+	return d, nil
 }

@@ -1,0 +1,1299 @@
+diff --git a/server/config.go b/server/config.go
+index c6ba696..0e7133a 100644
+--- a/server/config.go
++++ b/server/config.go
+@@ -3,6 +3,7 @@ package server
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"net"
+ 	"os"
+ 	"path/filepath"
+ 	"strconv"
+@@ -43,6 +44,7 @@ const (
+ 	EnvS2ServerUser            = "S2_SERVER_USER"
+ 	EnvS2ServerPassword        = "S2_SERVER_PASSWORD" // #nosec G101 -- env var name, not a credential
+ 	EnvS2ServerBuckets         = "S2_SERVER_BUCKETS"
++	EnvS2ServerS3Domain        = "S2_SERVER_S3_DOMAIN"
+ )
+ 
+ // Config is a configuration for the server.
+@@ -59,9 +61,20 @@ type Config struct {
+ 	// the S3 listener. Its first path segment is reserved and cannot be
+ 	// used as a bucket name (Buckets.Create returns ErrReservedBucketName
+ 	// for that name). The default "/healthz" reserves the bucket name
+-	// "healthz". Must start with "/" and have at least one segment after
+-	// it. Set to an empty string to disable the health endpoint entirely.
++	// must start with "/" and have at least one segment after it. Set to an
++	// empty string to disable the health endpoint entirely.
+ 	HealthPath string `json:"health_path"`
++	// S3Domain optionally enables virtual-host-style bucket addressing on
++	// the S3 listener: a request to "<bucket>.<S3Domain>:<port>/<key>" is
++	// routed with the Host-derived bucket and the wire path as the key, for
++	// every bucket, object, copy and multipart operation. The bare domain's
++	// root keeps serving ListBuckets and the health endpoint. The value is
++	// normalized to a lowercased DNS name (scheme, port, path and a single
++	// FQDN trailing dot are stripped). Empty (the default) disables the
++	// feature entirely and all requests keep path-style behaviour; Hosts
++	// that target the domain with a trailing dot or an illegal bucket label
++	// are rejected with 400 instead of being reinterpreted as path-style.
++	S3Domain string `json:"s3_domain"`
+ 	// MaxUploadSize is the maximum upload size in bytes. When 0, a backend-specific
+ 	// default is used (see EffectiveMaxUploadSize): 5 GiB for osfs/s3, 16 MiB for
+ 	// memfs. The conservative memfs default protects the host from accidental
+@@ -158,6 +171,14 @@ func (cfg *Config) Validate() error {
+ 		}
+ 	}
+ 
++	if cfg.S3Domain != "" {
++		d, err := normalizeS3Domain(cfg.S3Domain)
++		if err != nil {
++			return fmt.Errorf("server: S3Domain: %w", err)
++		}
++		cfg.S3Domain = d
++	}
++
+ 	if cfg.User == AnonymousAccessKeyID {
+ 		return fmt.Errorf("server: User must not be %q; the anonymous principal is only configurable via a Users entry, which enforces the read-only action restriction", AnonymousAccessKeyID)
+ 	}
+@@ -276,6 +297,9 @@ func (cfg *Config) LoadEnv() error {
+ 	if v, ok := os.LookupEnv(EnvS2ServerHealthPath); ok {
+ 		cfg.HealthPath = v
+ 	}
++	if v, ok := os.LookupEnv(EnvS2ServerS3Domain); ok {
++		cfg.S3Domain = v
++	}
+ 	if typ := os.Getenv(EnvS2ServerType); typ != "" {
+ 		cfg.Type = s2.Type(typ)
+ 	}
+@@ -314,3 +338,47 @@ func (cfg *Config) LoadEnv() error {
+ 	}
+ 	return nil
+ }
++
++// normalizeS3Domain normalizes a configured service domain to a plain
++// lowercased DNS name. It accepts the common pasted forms -- an
++// "http(s)://" URL with a path, a port, and a single FQDN trailing dot --
++// because scheme/port belong to the listener and the trailing dot is
++// conventional spelling; the wire Host header itself is never normalized
++// (its trailing dot is rejected by matchBucketHost). Each label must be
++// non-empty, at most 63 characters of [a-z0-9-], and not start or end
++// with a hyphen.
++func normalizeS3Domain(in string) (string, error) {
++	d := strings.ToLower(strings.TrimSpace(in))
++	for _, scheme := range []string{"https://", "http://"} {
++		d = strings.TrimPrefix(d, scheme)
++	}
++	// Keep the host portion of any pasted URL only.
++	if i := strings.IndexAny(d, "/?#"); i >= 0 {
++		d = d[:i]
++	}
++	// A port in the config is meaningless; the listener owns it.
++	if name, _, err := net.SplitHostPort(d); err == nil {
++		d = name
++	}
++	d = strings.TrimSuffix(d, ".")
++	if d == "" {
++		return "", fmt.Errorf("must not be empty")
++	}
++	for _, label := range strings.Split(d, ".") {
++		switch {
++		case label == "":
++			return "", fmt.Errorf("empty DNS label in %q", in)
++		case len(label) > 63:
++			return "", fmt.Errorf("DNS label %q is longer than 63 characters", label)
++		case strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-"):
++			return "", fmt.Errorf("DNS label %q must not start or end with a hyphen", label)
++		}
++		for i := 0; i < len(label); i++ {
++			c := label[i]
++			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
++				return "", fmt.Errorf("DNS label %q contains illegal character %q", label, c)
++			}
++		}
++	}
++	return d, nil
++}
+diff --git a/server/config_test.go b/server/config_test.go
+index e7adf27..dfb5a78 100644
+--- a/server/config_test.go
++++ b/server/config_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"encoding/json"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -467,3 +468,61 @@ func TestConfigValidateUsers(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestNormalizeS3Domain(t *testing.T) {
++	testCases := []struct {
++		caseName string
++		in       string
++		want     string
++		wantErr  bool
++	}{
++		{caseName: "plain domain", in: "s3.local.test", want: "s3.local.test"},
++		{caseName: "uppercase normalized", in: "S3.LOCAL.TEST", want: "s3.local.test"},
++		{caseName: "fqdn trailing dot stripped", in: "s3.local.test.", want: "s3.local.test"},
++		{caseName: "http url", in: "http://s3.local.test:9000/", want: "s3.local.test"},
++		{caseName: "https url with path", in: "https://s3.local.test/some/path", want: "s3.local.test"},
++		{caseName: "url with query", in: "http://s3.local.test?q=1", want: "s3.local.test"},
++		{caseName: "whitespace trimmed", in: "  s3.local.test  ", want: "s3.local.test"},
++		{caseName: "single label", in: "s3", want: "s3"},
++		{caseName: "numeric label", in: "s3.10", want: "s3.10"},
++
++		{caseName: "empty rejected", in: "", wantErr: true},
++		{caseName: "only dot rejected", in: ".", wantErr: true},
++		{caseName: "leading dot rejected", in: ".local.test", wantErr: true},
++		{caseName: "empty middle label rejected", in: "a..b.test", wantErr: true},
++		{caseName: "leading hyphen label rejected", in: "-bad.test", wantErr: true},
++		{caseName: "trailing hyphen label rejected", in: "bad-.test", wantErr: true},
++		{caseName: "underscore rejected", in: "s3_local.test", wantErr: true},
++		{caseName: "illegal char rejected", in: "s3!.local.test", wantErr: true},
++		{caseName: "label too long rejected", in: strings.Repeat("a", 64) + ".test", wantErr: true},
++	}
++	for _, tc := range testCases {
++		t.Run(tc.caseName, func(t *testing.T) {
++			got, err := normalizeS3Domain(tc.in)
++			if tc.wantErr {
++				assert.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++			assert.Equal(t, tc.want, got)
++		})
++	}
++}
++
++func TestValidateS3DomainNormalizedInPlace(t *testing.T) {
++	cfg := DefaultConfig()
++	cfg.S3Domain = "https://S3.LOCAL.TEST.:9000/"
++	require.NoError(t, cfg.Validate())
++	assert.Equal(t, "s3.local.test", cfg.S3Domain)
++
++	cfg = DefaultConfig()
++	cfg.S3Domain = "s3_local.test"
++	assert.Error(t, cfg.Validate())
++}
++
++func TestLoadEnvS3Domain(t *testing.T) {
++	t.Setenv(EnvS2ServerS3Domain, "s3.local.test")
++	cfg := DefaultConfig()
++	require.NoError(t, cfg.LoadEnv())
++	assert.Equal(t, "s3.local.test", cfg.S3Domain)
++}
+diff --git a/server/handlers/s3api/buckets.go b/server/handlers/s3api/buckets.go
+index 62dcd92..9cd6111 100644
+--- a/server/handlers/s3api/buckets.go
++++ b/server/handlers/s3api/buckets.go
+@@ -176,4 +176,8 @@ func init() {
+ 	server.RegisterS3HandleFunc("PUT /{bucket}", middleware.SigV4(handleCreateBucket))
+ 	server.RegisterS3HandleFunc("DELETE /{bucket}", middleware.SigV4(handleDeleteBucket))
+ 	server.RegisterS3HandleFunc("HEAD /{bucket}", middleware.SigV4(handleHeadBucket))
++
++	// Virtual-host-style has no root "{/$}" pattern: "/{key...}" also matches
++	// zero segments and the object handlers' existing empty-key delegation
++	// runs the bucket-root operation (see objects.go/multipart.go).
+ }
+diff --git a/server/handlers/s3api/multipart.go b/server/handlers/s3api/multipart.go
+index b5a4a3b..5a65926 100644
+--- a/server/handlers/s3api/multipart.go
++++ b/server/handlers/s3api/multipart.go
+@@ -549,4 +549,5 @@ func handleObjectPOST(s *server.Server, w http.ResponseWriter, r *http.Request)
+ 
+ func init() {
+ 	server.RegisterS3HandleFunc("POST /{bucket}/{key...}", middleware.SigV4(handleObjectPOST))
++	server.RegisterS3VHostHandleFunc("POST /{key...}", middleware.SigV4(handleObjectPOST))
+ }
+diff --git a/server/handlers/s3api/objects.go b/server/handlers/s3api/objects.go
+index 6eff83c..6c5b973 100644
+--- a/server/handlers/s3api/objects.go
++++ b/server/handlers/s3api/objects.go
+@@ -758,4 +758,13 @@ func init() {
+ 	server.RegisterS3HandleFunc("HEAD /{bucket}/{key...}", middleware.SigV4(handleGetObject))
+ 	server.RegisterS3HandleFunc("PUT /{bucket}/{key...}", middleware.SigV4(handlePutObject))
+ 	server.RegisterS3HandleFunc("DELETE /{bucket}/{key...}", middleware.SigV4(handleDeleteObject))
++
++	// Virtual-host-style: the bucket comes from the Host and the single
++	// "/{key...}" pattern covers both objects and bucket-root operations via
++	// the empty-key delegation above (GET "/" lists objects, PUT "/" creates
++	// the bucket, and so on), mirroring path-style trailing-slash requests.
++	server.RegisterS3VHostHandleFunc("GET /{key...}", middleware.SigV4(handleGetObject))
++	server.RegisterS3VHostHandleFunc("HEAD /{key...}", middleware.SigV4(handleGetObject))
++	server.RegisterS3VHostHandleFunc("PUT /{key...}", middleware.SigV4(handlePutObject))
++	server.RegisterS3VHostHandleFunc("DELETE /{key...}", middleware.SigV4(handleDeleteObject))
+ }
+diff --git a/server/handlers/s3api/vhost_test.go b/server/handlers/s3api/vhost_test.go
+new file mode 100644
+index 0000000..adb2258
+--- /dev/null
++++ b/server/handlers/s3api/vhost_test.go
+@@ -0,0 +1,783 @@
++package s3api
++
++import (
++	"bytes"
++	"context"
++	"crypto/hmac"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/xml"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"sort"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/mojatter/s2"
++	"github.com/mojatter/s2/server"
++	"github.com/stretchr/testify/require"
++)
++
++const (
++	vhostTestDomain    = "s3.local.test"
++	vhostTestAccessKey = "testak"
++	vhostTestSecret    = "testsecret"
++	vhostTestRegion    = "us-east-1"
++	vhostTestService   = "s3"
++
++	vhostEmptySHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
++)
++
++// vhostHarness wires a real listener and server; requests carry arbitrary
++// Host headers (set on req.Host) so no DNS is involved.
++type vhostHarness struct {
++	t      *testing.T
++	srv    *server.Server
++	ts     *httptest.Server
++	client *http.Client
++}
++
++func newVhostHarness(t *testing.T, configure func(*server.Config)) *vhostHarness {
++	cfg := server.DefaultConfig()
++	cfg.Root = t.TempDir()
++	cfg.S3Domain = vhostTestDomain
++	cfg.User = vhostTestAccessKey
++	cfg.Password = vhostTestSecret
++	if configure != nil {
++		configure(cfg)
++	}
++	srv, err := server.NewServer(context.Background(), cfg)
++	require.NoError(t, err)
++	ts := httptest.NewServer(srv.S3Handler())
++	t.Cleanup(ts.Close)
++	return &vhostHarness{
++		t:      t,
++		srv:    srv,
++		ts:     ts,
++		client: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
++	}
++}
++
++func (h *vhostHarness) request(method, host, target string, body []byte) *http.Request {
++	h.t.Helper()
++	var rdr io.Reader
++	if body != nil {
++		rdr = bytes.NewReader(body)
++	}
++	req, err := http.NewRequest(method, h.ts.URL+target, rdr)
++	require.NoError(h.t, err)
++	if host != "" {
++		req.Host = host
++	}
++	return req
++}
++
++func (h *vhostHarness) do(req *http.Request) (*http.Response, string) {
++	h.t.Helper()
++	resp, err := h.client.Do(req)
++	require.NoError(h.t, err)
++	b, err := io.ReadAll(resp.Body)
++	require.NoError(h.t, err)
++	require.NoError(h.t, resp.Body.Close())
++	return resp, string(b)
++}
++
++func (h *vhostHarness) seedObject(bucket, key, content string) {
++	h.t.Helper()
++	ctx := context.Background()
++	if ok, _ := h.srv.Buckets.Exists(ctx, bucket); !ok {
++		require.NoError(h.t, h.srv.Buckets.Create(ctx, bucket))
++	}
++	strg, err := h.srv.Buckets.Get(ctx, bucket)
++	require.NoError(h.t, err)
++	require.NoError(h.t, strg.Put(ctx, s2.NewObjectBytes(key, []byte(content))))
++}
++
++// ---------------------------------------------------------------------------
++// Test-side SigV4 implementation, mirroring server/middleware semantics so a
++// signature produced here is exactly what the AWS SDK would produce.
++// ---------------------------------------------------------------------------
++
++func vhostSHA256(b []byte) string {
++	sum := sha256.Sum256(b)
++	return hex.EncodeToString(sum[:])
++}
++
++func vhostHMAC(key, data []byte) []byte {
++	h := hmac.New(sha256.New, key)
++	h.Write(data)
++	return h.Sum(nil)
++}
++
++func vhostSigningKey(secret, date string) []byte {
++	kDate := vhostHMAC([]byte("AWS4"+secret), []byte(date))
++	kRegion := vhostHMAC(kDate, []byte(vhostTestRegion))
++	kService := vhostHMAC(kRegion, []byte(vhostTestService))
++	return vhostHMAC(kService, []byte("aws4_request"))
++}
++
++func vhostURIEncode(s string) string {
++	var b strings.Builder
++	for i := 0; i < len(s); i++ {
++		c := s[i]
++		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
++			c == '-' || c == '_' || c == '.' || c == '~' {
++			b.WriteByte(c)
++		} else {
++			fmt.Fprintf(&b, "%%%02X", c)
++		}
++	}
++	return b.String()
++}
++
++func vhostCanonicalURI(r *http.Request) string {
++	if r.URL.Path == "" {
++		return "/"
++	}
++	segments := strings.Split(r.URL.Path, "/")
++	for i, seg := range segments {
++		segments[i] = vhostURIEncode(seg)
++	}
++	return strings.Join(segments, "/")
++}
++
++func vhostCanonicalQuery(rawQuery string) string {
++	if rawQuery == "" {
++		return ""
++	}
++	type kv struct{ k, v string }
++	var pairs []kv
++	for _, part := range strings.Split(rawQuery, "&") {
++		if part == "" {
++			continue
++		}
++		idx := strings.IndexByte(part, '=')
++		var k, v string
++		if idx < 0 {
++			k = part
++		} else {
++			k, v = part[:idx], part[idx+1:]
++		}
++		kDec, _ := url.QueryUnescape(k)
++		vDec, _ := url.QueryUnescape(v)
++		pairs = append(pairs, kv{vhostURIEncode(kDec), vhostURIEncode(vDec)})
++	}
++	sort.Slice(pairs, func(i, j int) bool {
++		if pairs[i].k != pairs[j].k {
++			return pairs[i].k < pairs[j].k
++		}
++		return pairs[i].v < pairs[j].v
++	})
++	parts := make([]string, len(pairs))
++	for i, p := range pairs {
++		parts[i] = p.k + "=" + p.v
++	}
++	return strings.Join(parts, "&")
++}
++
++func vhostHeaderValue(r *http.Request, name string) string {
++	if name == "host" {
++		if r.Host != "" {
++			return r.Host
++		}
++		return r.URL.Host
++	}
++	return strings.TrimSpace(r.Header.Get(name))
++}
++
++func vhostCanonicalRequest(r *http.Request, headers []string, rawQuery, payloadHash string) string {
++	sorted := append([]string(nil), headers...)
++	sort.Strings(sorted)
++	var b strings.Builder
++	b.WriteString(r.Method)
++	b.WriteByte('\n')
++	b.WriteString(vhostCanonicalURI(r))
++	b.WriteByte('\n')
++	b.WriteString(vhostCanonicalQuery(rawQuery))
++	b.WriteByte('\n')
++	for _, name := range sorted {
++		b.WriteString(name)
++		b.WriteByte(':')
++		b.WriteString(vhostHeaderValue(r, name))
++		b.WriteByte('\n')
++	}
++	b.WriteByte('\n')
++	b.WriteString(strings.Join(sorted, ";"))
++	b.WriteByte('\n')
++	b.WriteString(payloadHash)
++	return b.String()
++}
++
++// vhostSignHeader adds an Authorization-header signature. Every present
++// x-amz-* header plus host is signed, like the AWS SDK.
++func vhostSignHeader(r *http.Request, accessKey, secret string, now time.Time) {
++	date := now.Format("20060102")
++	datetime := now.Format("20060102T150405Z")
++	if r.Header.Get("X-Amz-Content-Sha256") == "" {
++		r.Header.Set("X-Amz-Content-Sha256", vhostEmptySHA)
++	}
++	payloadHash := r.Header.Get("X-Amz-Content-Sha256")
++	r.Header.Set("X-Amz-Date", datetime)
++
++	seen := map[string]bool{"host": true}
++	var headers []string
++	for name := range r.Header {
++		lname := strings.ToLower(name)
++		if strings.HasPrefix(lname, "x-amz-") && !seen[lname] {
++			seen[lname] = true
++			headers = append(headers, lname)
++		}
++	}
++	headers = append(headers, "host")
++	sort.Strings(headers)
++
++	scope := date + "/" + vhostTestRegion + "/" + vhostTestService + "/aws4_request"
++	canon := vhostCanonicalRequest(r, headers, r.URL.RawQuery, payloadHash)
++	sts := "AWS4-HMAC-SHA256\n" + datetime + "\n" + scope + "\n" + vhostSHA256([]byte(canon))
++	sig := hex.EncodeToString(vhostHMAC(vhostSigningKey(secret, date), []byte(sts)))
++	r.Header.Set("Authorization", fmt.Sprintf(
++		"AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
++		accessKey, scope, strings.Join(headers, ";"), sig))
++}
++
++// vhostPresign rewrites RawQuery into a presigned URL.
++func vhostPresign(r *http.Request, accessKey, secret string, expires int, now time.Time) {
++	date := now.Format("20060102")
++	datetime := now.Format("20060102T150405Z")
++	if r.Host == "" {
++		r.Host = vhostTestDomain
++	}
++	scope := date + "/" + vhostTestRegion + "/" + vhostTestService + "/aws4_request"
++
++	q := r.URL.Query()
++	q.Set("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
++	q.Set("X-Amz-Credential", accessKey+"/"+scope)
++	q.Set("X-Amz-Date", datetime)
++	q.Set("X-Amz-Expires", fmt.Sprintf("%d", expires))
++	q.Set("X-Amz-SignedHeaders", "host")
++	r.URL.RawQuery = q.Encode()
++
++	canon := vhostCanonicalRequest(r, []string{"host"}, r.URL.RawQuery, "UNSIGNED-PAYLOAD")
++	sts := "AWS4-HMAC-SHA256\n" + datetime + "\n" + scope + "\n" + vhostSHA256([]byte(canon))
++	sig := hex.EncodeToString(vhostHMAC(vhostSigningKey(secret, date), []byte(sts)))
++
++	q.Set("X-Amz-Signature", sig)
++	r.URL.RawQuery = q.Encode()
++}
++
++// ---------------------------------------------------------------------------
++// Routing: object with an encoded space, all operations
++// ---------------------------------------------------------------------------
++
++func TestVHostObjectWithEncodedSpace(t *testing.T) {
++	h := newVhostHarness(t, nil)
++	h.seedObject("photos", "dir/a b.txt", "hello-space")
++
++	req := h.request(http.MethodGet, "photos."+vhostTestDomain, "/dir/a%20b.txt", nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, body := h.do(req)
++
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++	require.Equal(t, "hello-space", body)
++}
++
++func TestVHostObjectPortStripped(t *testing.T) {
++	h := newVhostHarness(t, nil)
++	h.seedObject("photos", "dir/a b.txt", "hello-port")
++
++	// Host carries the listener port; it is stripped for classification but
++	// stays part of the signed Host header value.
++	req := h.request(http.MethodGet, "photos."+vhostTestDomain+":9000", "/dir/a%20b.txt", nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, body := h.do(req)
++
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++	require.Equal(t, "hello-port", body)
++}
++
++// ---------------------------------------------------------------------------
++// Signature tampering: Host, path, query each independently signed
++// ---------------------------------------------------------------------------
++
++func TestVHostSignedHostTamperRejected(t *testing.T) {
++	h := newVhostHarness(t, nil)
++	h.seedObject("photos", "dir/a b.txt", "x")
++	h.seedObject("otherbucket", "secret.txt", "y")
++
++	req := h.request(http.MethodGet, "photos."+vhostTestDomain, "/dir/a%20b.txt", nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	// Resign nothing; just present the signed request to another bucket host.
++	req.Host = "otherbucket." + vhostTestDomain
++	resp, body := h.do(req)
++
++	require.Equal(t, http.StatusForbidden, resp.StatusCode, body)
++	require.Contains(t, body, "SignatureDoesNotMatch")
++}
++
++func TestVHostSignedPathTamperRejected(t *testing.T) {
++	h := newVhostHarness(t, nil)
++	h.seedObject("photos", "dir/a b.txt", "x")
++	h.seedObject("photos", "dir/c.txt", "leaked")
++
++	signed := h.request(http.MethodGet, "photos."+vhostTestDomain, "/dir/a%20b.txt", nil)
++	vhostSignHeader(signed, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++
++	tampered := h.request(http.MethodGet, "photos."+vhostTestDomain, "/dir/c.txt", nil)
++	tampered.Header = signed.Header.Clone()
++	resp, body := h.do(tampered)
++
++	require.Equal(t, http.StatusForbidden, resp.StatusCode, body)
++	require.Contains(t, body, "SignatureDoesNotMatch")
++}
++
++func TestVHostSignedQueryTamperRejected(t *testing.T) {
++	h := newVhostHarness(t, nil)
++	h.seedObject("photos", "dir/a b.txt", "x")
++
++	req := h.request(http.MethodGet, "photos."+vhostTestDomain, "/dir/a%20b.txt", nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	req.URL.RawQuery += "&tampered=1"
++	resp, body := h.do(req)
++
++	require.Equal(t, http.StatusForbidden, resp.StatusCode, body)
++	require.Contains(t, body, "SignatureDoesNotMatch")
++}
++
++// ---------------------------------------------------------------------------
++// Presigned URLs
++// ---------------------------------------------------------------------------
++
++func TestVHostPresignedURL(t *testing.T) {
++	h := newVhostHarness(t, nil)
++	h.seedObject("photos", "dir/a b.txt", "presigned-body")
++
++	req := h.request(http.MethodGet, "photos."+vhostTestDomain, "/dir/a%20b.txt", nil)
++	vhostPresign(req, vhostTestAccessKey, vhostTestSecret, 300, time.Now().UTC())
++	resp, body := h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++	require.Equal(t, "presigned-body", body)
++}
++
++func TestVHostPresignedURLQueryTamperRejected(t *testing.T) {
++	h := newVhostHarness(t, nil)
++	h.seedObject("photos", "dir/a b.txt", "x")
++
++	req := h.request(http.MethodGet, "photos."+vhostTestDomain, "/dir/a%20b.txt", nil)
++	vhostPresign(req, vhostTestAccessKey, vhostTestSecret, 300, time.Now().UTC())
++	req.URL.RawQuery += "&tampered=1"
++	resp, body := h.do(req)
++	require.Equal(t, http.StatusForbidden, resp.StatusCode, body)
++	require.Contains(t, body, "SignatureDoesNotMatch")
++}
++
++func TestVHostPresignedURLExpiredRejected(t *testing.T) {
++	h := newVhostHarness(t, nil)
++	h.seedObject("photos", "dir/a b.txt", "x")
++
++	req := h.request(http.MethodGet, "photos."+vhostTestDomain, "/dir/a%20b.txt", nil)
++	vhostPresign(req, vhostTestAccessKey, vhostTestSecret, 300, time.Now().Add(-10*time.Minute).UTC())
++	resp, body := h.do(req)
++	require.Equal(t, http.StatusForbidden, resp.StatusCode, body)
++	require.Contains(t, body, "SignatureDoesNotMatch")
++}
++
++// ---------------------------------------------------------------------------
++// Principal policy is evaluated against the same logical (Host) resource
++// ---------------------------------------------------------------------------
++
++func TestVHostPolicyScopedToBucket(t *testing.T) {
++	const limitedAK, limitedSecret = "limited", "limited-secret"
++	h := newVhostHarness(t, func(cfg *server.Config) {
++		cfg.Users = []server.User{{
++			AccessKeyID:     limitedAK,
++			SecretAccessKey: limitedSecret,
++			Policy: &server.Policy{
++				Version: "2012-10-17",
++				Statement: []server.Statement{{
++					Effect:   "Allow",
++					Action:   []string{"s3:GetObject"},
++					Resource: []string{"arn:aws:s3:::photos/*"},
++				}},
++			},
++		}}
++	})
++	h.seedObject("photos", "dir/a b.txt", "allowed")
++	h.seedObject("otherbucket", "secret.txt", "secret")
++
++	// Allowed: same logical bucket/key the policy names.
++	req := h.request(http.MethodGet, "photos."+vhostTestDomain, "/dir/a%20b.txt", nil)
++	vhostSignHeader(req, limitedAK, limitedSecret, time.Now().UTC())
++	resp, body := h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++	require.Equal(t, "allowed", body)
++
++	// Denied: Host bucket otherbucket is a distinct resource.
++	req = h.request(http.MethodGet, "otherbucket."+vhostTestDomain, "/secret.txt", nil)
++	vhostSignHeader(req, limitedAK, limitedSecret, time.Now().UTC())
++	resp, body = h.do(req)
++	require.Equal(t, http.StatusForbidden, resp.StatusCode, body)
++	require.Contains(t, body, "AccessDenied")
++
++	// Denied: PutObject not in the policy, same bucket.
++	req = h.request(http.MethodPut, "photos."+vhostTestDomain, "/new.txt", []byte("data"))
++	req.Header.Set("X-Amz-Content-Sha256", vhostSHA256([]byte("data")))
++	vhostSignHeader(req, limitedAK, limitedSecret, time.Now().UTC())
++	resp, body = h.do(req)
++	require.Equal(t, http.StatusForbidden, resp.StatusCode, body)
++	require.Contains(t, body, "AccessDenied")
++
++	// Denied: ListBucket not granted.
++	req = h.request(http.MethodGet, "photos."+vhostTestDomain, "/", nil)
++	vhostSignHeader(req, limitedAK, limitedSecret, time.Now().UTC())
++	resp, body = h.do(req)
++	require.Equal(t, http.StatusForbidden, resp.StatusCode, body)
++	require.Contains(t, body, "AccessDenied")
++}
++
++func TestVHostPolicyExactKeyWithSpace(t *testing.T) {
++	const limitedAK, limitedSecret = "exact", "exact-secret"
++	h := newVhostHarness(t, func(cfg *server.Config) {
++		cfg.Users = []server.User{{
++			AccessKeyID:     limitedAK,
++			SecretAccessKey: limitedSecret,
++			Policy: &server.Policy{
++				Version: "2012-10-17",
++				Statement: []server.Statement{{
++					Effect:   "Allow",
++					Action:   []string{"s3:GetObject"},
++					Resource: []string{"arn:aws:s3:::photos/dir/a b.txt"},
++				}},
++			},
++		}}
++	})
++	h.seedObject("photos", "dir/a b.txt", "exact")
++	h.seedObject("photos", "dir/c.txt", "other")
++
++	req := h.request(http.MethodGet, "photos."+vhostTestDomain, "/dir/a%20b.txt", nil)
++	vhostSignHeader(req, limitedAK, limitedSecret, time.Now().UTC())
++	resp, body := h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++
++	req = h.request(http.MethodGet, "photos."+vhostTestDomain, "/dir/c.txt", nil)
++	vhostSignHeader(req, limitedAK, limitedSecret, time.Now().UTC())
++	resp, body = h.do(req)
++	require.Equal(t, http.StatusForbidden, resp.StatusCode, body)
++	require.Contains(t, body, "AccessDenied")
++}
++
++// ---------------------------------------------------------------------------
++// Service root: ListBuckets and health on the bare domain; path-style still
++// works on the root and on unknown hosts.
++// ---------------------------------------------------------------------------
++
++func TestVHostServiceRootListBucketsAndHealth(t *testing.T) {
++	h := newVhostHarness(t, nil)
++	h.seedObject("photos", "dir/a b.txt", "x")
++	h.seedObject("otherbucket", "k.txt", "y")
++
++	// ListBuckets on the bare domain.
++	req := h.request(http.MethodGet, vhostTestDomain, "/", nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, body := h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++	var result ListAllMyBucketsResult
++	require.NoError(t, xml.Unmarshal([]byte(body), &result))
++	names := make(map[string]bool)
++	for _, b := range result.Buckets {
++		names[b.Name] = true
++	}
++	require.True(t, names["photos"])
++	require.True(t, names["otherbucket"])
++
++	// Health on the bare domain.
++	req = h.request(http.MethodGet, vhostTestDomain, "/healthz", nil)
++	resp, body = h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++	require.Equal(t, "ok", body)
++
++	// Path-style on the bare domain keeps working.
++	req = h.request(http.MethodGet, vhostTestDomain, "/photos/dir/a%20b.txt", nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, body = h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++	require.Equal(t, "x", body)
++
++	// Path-style on an unknown host keeps working (local SDK setups).
++	req = h.request(http.MethodGet, "localhost:9000", "/photos/dir/a%20b.txt", nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, body = h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++
++	// Health on an unknown host keeps the previous behaviour.
++	req = h.request(http.MethodGet, "127.0.0.1:9000", "/healthz", nil)
++	resp, body = h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++	require.Equal(t, "ok", body)
++}
++
++func TestVHostHealthNamedKeyIsObject(t *testing.T) {
++	h := newVhostHarness(t, nil)
++	h.seedObject("photos", "healthz", "object-health")
++
++	// On the bucket host, /healthz is the object key.
++	req := h.request(http.MethodGet, "photos."+vhostTestDomain, "/healthz", nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, body := h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++	require.Equal(t, "object-health", body)
++
++	// On the bare domain, /healthz remains the health endpoint.
++	req = h.request(http.MethodGet, vhostTestDomain, "/healthz", nil)
++	resp, body = h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++	require.Equal(t, "ok", body)
++}
++
++// Bucket host "/" is ListObjects, not ListBuckets.
++func TestVHostBucketRootListObjects(t *testing.T) {
++	h := newVhostHarness(t, nil)
++	h.seedObject("photos", "dir/a b.txt", "listed")
++
++	req := h.request(http.MethodGet, "photos."+vhostTestDomain, "/?prefix=dir/", nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, body := h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++	var result ListBucketResult
++	require.NoError(t, xml.Unmarshal([]byte(body), &result))
++	require.Equal(t, "photos", result.Name)
++	var keys []string
++	for _, c := range result.Contents {
++		keys = append(keys, c.Key)
++	}
++	require.Contains(t, keys, "dir/a b.txt")
++}
++
++// ---------------------------------------------------------------------------
++// Bucket-root operations: HEAD, DELETE (empty/nonempty), PUT to create
++// ---------------------------------------------------------------------------
++
++func TestVHostBucketRootHeadDeleteCreate(t *testing.T) {
++	h := newVhostHarness(t, nil)
++	h.seedObject("photos", "k.txt", "data")
++
++	// HEAD existing bucket.
++	req := h.request(http.MethodHead, "photos."+vhostTestDomain, "/", nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, _ := h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode)
++
++	// DELETE nonempty -> BucketNotEmpty.
++	req = h.request(http.MethodDelete, "photos."+vhostTestDomain, "/", nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, body := h.do(req)
++	require.Equal(t, http.StatusConflict, resp.StatusCode, body)
++	require.Contains(t, body, "BucketNotEmpty")
++
++	// DELETE an empty bucket via its host.
++	require.NoError(t, h.srv.Buckets.Create(context.Background(), "empty-bucket"))
++	req = h.request(http.MethodDelete, "empty-bucket."+vhostTestDomain, "/", nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, _ = h.do(req)
++	require.Equal(t, http.StatusNoContent, resp.StatusCode)
++	exists, err := h.srv.Buckets.Exists(context.Background(), "empty-bucket")
++	require.NoError(t, err)
++	require.False(t, exists)
++
++	// PUT to a not-yet-existing bucket's host creates it.
++	req = h.request(http.MethodPut, "brand-new."+vhostTestDomain, "/", nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, _ = h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode)
++	exists, err = h.srv.Buckets.Exists(context.Background(), "brand-new")
++	require.NoError(t, err)
++	require.True(t, exists)
++}
++
++// ---------------------------------------------------------------------------
++// DeleteObjects on the bucket host (POST /?delete)
++// ---------------------------------------------------------------------------
++
++func TestVHostDeleteObjects(t *testing.T) {
++	h := newVhostHarness(t, nil)
++	h.seedObject("photos", "dir/a b.txt", "x")
++
++	xmlBody := []byte(`<Delete><Object><Key>dir/a b.txt</Key></Object></Delete>`)
++	req := h.request(http.MethodPost, "photos."+vhostTestDomain, "/?delete", xmlBody)
++	req.Header.Set("Content-Type", "application/xml")
++	req.Header.Set("X-Amz-Content-Sha256", vhostSHA256(xmlBody))
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, bodyStr := h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode, bodyStr)
++
++	strg, err := h.srv.Buckets.Get(context.Background(), "photos")
++	require.NoError(t, err)
++	_, err = strg.Get(context.Background(), "dir/a b.txt")
++	require.ErrorIs(t, err, s2.ErrNotExist)
++}
++
++// ---------------------------------------------------------------------------
++// Multipart lifecycle fully signed on the bucket host
++// ---------------------------------------------------------------------------
++
++func TestVHostMultipartLifecycle(t *testing.T) {
++	h := newVhostHarness(t, nil)
++	require.NoError(t, h.srv.Buckets.Create(context.Background(), "photos"))
++
++	// Initiate.
++	req := h.request(http.MethodPost, "photos."+vhostTestDomain, "/big.bin?uploads", nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, body := h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++	var initiated InitiateMultipartUploadResult
++	require.NoError(t, xml.Unmarshal([]byte(body), &initiated))
++	require.Equal(t, "photos", initiated.Bucket)
++	uploadID := initiated.UploadID
++
++	// Parts.
++	part1 := []byte("part1-")
++	req = h.request(http.MethodPut, "photos."+vhostTestDomain, "/big.bin?partNumber=1&uploadId="+uploadID, part1)
++	req.Header.Set("X-Amz-Content-Sha256", vhostSHA256(part1))
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, _ = h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode)
++	etag1 := resp.Header.Get("ETag")
++
++	part2 := []byte("part2")
++	req = h.request(http.MethodPut, "photos."+vhostTestDomain, "/big.bin?partNumber=2&uploadId="+uploadID, part2)
++	req.Header.Set("X-Amz-Content-Sha256", vhostSHA256(part2))
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, _ = h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode)
++	etag2 := resp.Header.Get("ETag")
++
++	// Complete.
++	complete := fmt.Sprintf(
++		`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part>`+
++			`<Part><PartNumber>2</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, etag1, etag2)
++	req = h.request(http.MethodPost, "photos."+vhostTestDomain, "/big.bin?uploadId="+uploadID, []byte(complete))
++	req.Header.Set("Content-Type", "application/xml")
++	req.Header.Set("X-Amz-Content-Sha256", vhostSHA256([]byte(complete)))
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, body = h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++
++	// Assembled object.
++	req = h.request(http.MethodGet, "photos."+vhostTestDomain, "/big.bin", nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, body = h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++	require.Equal(t, "part1-part2", body)
++
++	// Abort a second upload.
++	req = h.request(http.MethodPost, "photos."+vhostTestDomain, "/abort.bin?uploads", nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	_, body = h.do(req)
++	var aborted InitiateMultipartUploadResult
++	require.NoError(t, xml.Unmarshal([]byte(body), &aborted))
++
++	req = h.request(http.MethodDelete, "photos."+vhostTestDomain, "/abort.bin?uploadId="+aborted.UploadID, nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, _ = h.do(req)
++	require.Equal(t, http.StatusNoContent, resp.StatusCode)
++}
++
++// ---------------------------------------------------------------------------
++// CopyObject fully signed, source via the copy-source header
++// ---------------------------------------------------------------------------
++
++func TestVHostCopyObject(t *testing.T) {
++	h := newVhostHarness(t, nil)
++	h.seedObject("otherbucket", "src.txt", "copy-source")
++	require.NoError(t, h.srv.Buckets.Create(context.Background(), "photos"))
++
++	req := h.request(http.MethodPut, "photos."+vhostTestDomain, "/copied.txt", nil)
++	req.Header.Set("X-Amz-Copy-Source", "/otherbucket/src.txt")
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, body := h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++
++	req = h.request(http.MethodGet, "photos."+vhostTestDomain, "/copied.txt", nil)
++	vhostSignHeader(req, vhostTestAccessKey, vhostTestSecret, time.Now().UTC())
++	resp, body = h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++	require.Equal(t, "copy-source", body)
++}
++
++// ---------------------------------------------------------------------------
++// Invalid hosts: deterministic 400 XML, CORS still applied
++// ---------------------------------------------------------------------------
++
++func TestVHostInvalidHosts(t *testing.T) {
++	h := newVhostHarness(t, nil)
++
++	invalidHosts := []string{
++		"photos." + vhostTestDomain + ".",          // trailing dot bucket
++		"photos." + vhostTestDomain + ".:9000",     // trailing dot with port
++		vhostTestDomain + ".",                      // trailing dot root
++		"Photos." + vhostTestDomain,                // uppercase
++		"ab." + vhostTestDomain,                    // too short
++		"my.photos." + vhostTestDomain,             // dotted prefix
++		"my_photos." + vhostTestDomain,             // underscore
++	}
++	for _, host := range invalidHosts {
++		req := h.request(http.MethodGet, host, "/dir/a%20b.txt", nil)
++		resp, body := h.do(req)
++		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "host %q", host)
++		require.Contains(t, body, "<Code>InvalidArgument</Code>", "host %q", host)
++		// CORS still applies.
++		require.Equal(t, "*", resp.Header.Get("Access-Control-Allow-Origin"), "host %q", host)
++	}
++
++	// OPTIONS preflight to a bucket host short-circuits unchanged.
++	req := h.request(http.MethodOptions, "photos."+vhostTestDomain, "/dir/a%20b.txt", nil)
++	resp, _ := h.do(req)
++	require.Equal(t, http.StatusOK, resp.StatusCode)
++	require.Equal(t, "*", resp.Header.Get("Access-Control-Allow-Origin"))
++}
++
++// ---------------------------------------------------------------------------
++// Feature disabled: wire Host is ignored entirely; path-style for all.
++// ---------------------------------------------------------------------------
++
++func TestVHostDisabledKeepsPathStyle(t *testing.T) {
++	cfg := server.DefaultConfig()
++	cfg.Root = t.TempDir()
++	// No S3Domain, no auth.
++	srv, err := server.NewServer(context.Background(), cfg)
++	require.NoError(t, err)
++	ts := httptest.NewServer(srv.S3Handler())
++	defer ts.Close()
++
++	ctx := context.Background()
++	require.NoError(t, srv.Buckets.Create(ctx, "photos"))
++	strg, err := srv.Buckets.Get(ctx, "photos")
++	require.NoError(t, err)
++	require.NoError(t, strg.Put(ctx, s2.NewObjectBytes("dir/a b.txt", []byte("plain"))))
++
++	doHost := func(host, target string) (*http.Response, string) {
++		req, err := http.NewRequest(http.MethodGet, ts.URL+target, nil)
++		require.NoError(t, err)
++		req.Host = host
++		resp, err := http.DefaultClient.Do(req)
++		require.NoError(t, err)
++		b, err := io.ReadAll(resp.Body)
++		require.NoError(t, err)
++		require.NoError(t, resp.Body.Close())
++		return resp, string(b)
++	}
++
++	// Path-style works regardless of the Host.
++	resp, body := doHost("photos."+vhostTestDomain, "/photos/dir/a%20b.txt")
++	require.Equal(t, http.StatusOK, resp.StatusCode, body)
++	require.Equal(t, "plain", body)
++
++	// A virtual-host-shaped path is NOT reinterpreted: first path segment is
++	// the bucket ("dir"), which does not exist.
++	resp, body = doHost("photos."+vhostTestDomain, "/dir/a%20b.txt")
++	require.Equal(t, http.StatusNotFound, resp.StatusCode, body)
++	require.Contains(t, body, "NoSuchBucket")
++}
+diff --git a/server/s3api.go b/server/s3api.go
+index a4c1b1a..e30455f 100644
+--- a/server/s3api.go
++++ b/server/s3api.go
+@@ -49,11 +49,19 @@ var s3Handlers = map[string]HandlerFunc{}
+ // S3Handler builds an HTTP handler that serves the S3-compatible API:
+ // routes registered via RegisterS3HandleFunc, wrapped with the health
+ // endpoint at cfg.HealthPath (when set) and permissive CORS headers.
++//
++// When cfg.S3Domain is set, virtual-host-style bucket requests
++// ("<bucket>.<domain>/<key>") are dispatched to the vhost registry before
++// the path-style chain; the bare domain and unknown hosts keep the chain
++// below unchanged. When it is empty the router passes every request
++// straight through, so the unconfigured chain is byte-for-byte the
++// previous one.
+ func (s *Server) S3Handler() http.Handler {
+ 	reject := func(w http.ResponseWriter, r *http.Request) {
+ 		WriteS3Error(w, r, "InvalidArgument", "The request path is not valid", http.StatusBadRequest)
+ 	}
+-	return s.buildMux(s3Handlers, cleanPathHandler(reject), healthHandler(s.Config.HealthPath), corsHandler)
++	pathStyle := s.buildMux(s3Handlers, cleanPathHandler(reject), healthHandler(s.Config.HealthPath))
++	return corsHandler(virtualHostRouter(s.Config.S3Domain, pathStyle, s.buildVHostMux(s3VHostHandlers, reject)))
+ }
+ 
+ // cleanPathHandler answers with reject when the request path is not already
+diff --git a/server/vhost.go b/server/vhost.go
+new file mode 100644
+index 0000000..365e5c5
+--- /dev/null
++++ b/server/vhost.go
+@@ -0,0 +1,154 @@
++package server
++
++import (
++	"context"
++	"net"
++	"net/http"
++	"strings"
++)
++
++// vhostMode is the result of classifying a request Host against the
++// configured virtual-host-style service domain.
++type vhostMode int
++
++const (
++	// vhostPathStyle: the Host does not address the configured service
++	// domain; the request keeps existing path-style behaviour. This is also
++	// the only mode when no domain is configured.
++	vhostPathStyle vhostMode = iota
++	// vhostServiceRoot: the Host is the bare configured domain (e.g.
++	// "s3.local.test:9000"); its root keeps serving ListBuckets and the
++	// health endpoint, and in-path bucket names stay path-style.
++	vhostServiceRoot
++	// vhostBucket: the Host is "<bucket>.<domain>" with a legal single
++	// bucket label; the request is routed with the Host-derived bucket and
++	// the wire path verbatim as the key.
++	vhostBucket
++	// vhostInvalid: the Host clearly targets the configured domain (or its
++	// FQDN form with a trailing dot) but its suffix match or bucket prefix
++	// is malformed. The request is rejected outright instead of being
++	// reinterpreted as a path-style resource, which could land it silently
++	// in the bucket named by the first path segment.
++	vhostInvalid
++)
++
++// matchBucketHost classifies host against the configured domain.
++//
++// Matching is exact and case-sensitive after the config's normalization:
++//   - a port suffix is stripped first (it belongs to the listener, not the
++//     DNS name) and never affects the result;
++//   - only a Host that ends with "."+domain and whose remaining prefix is a
++//     single legal bucket label (no dots, 3-63 chars, [a-z0-9-]) is
++//     virtual-host addressing;
++//   - the bare domain is the service root;
++//   - any FQDN trailing dot (on the bucket host or the root) and any other
++//     malformed prefix that still sits directly on the domain is invalid;
++//   - anything else (IP literals, localhost, look-alike names such as
++//     "evils3.local.test") is plain path-style.
++func matchBucketHost(host, domain string) (bucket string, mode vhostMode) {
++	if domain == "" {
++		return "", vhostPathStyle
++	}
++	h := host
++	// SplitHostPort errors on a bare name without a port; in that case keep host as-is.
++	if name, _, err := net.SplitHostPort(h); err == nil {
++		h = name
++	}
++	switch {
++	case h == domain:
++		return "", vhostServiceRoot
++	case strings.HasSuffix(h, "."+domain):
++		prefix := h[:len(h)-len("."+domain)]
++		if isVHostBucketLabel(prefix) {
++			return prefix, vhostBucket
++		}
++		return "", vhostInvalid
++	case h == domain+".":
++		// Bare service root spelled as an FQDN; exact match is required, so it is not silently the root.
++		return "", vhostInvalid
++	case strings.HasSuffix(h, "."+domain+"."):
++		// Bucket host (or a deeper name) with an FQDN trailing dot; never falls through to path-style.
++		return "", vhostInvalid
++	default:
++		return "", vhostPathStyle
++	}
++}
++
++// isVHostBucketLabel reports whether s is a legal bucket name consisting of
++// a single DNS label. S3 bucket names may carry dots, but a dotted prefix
++// over the configured suffix cannot be distinguished from an unrelated
++// deeper hostname, so virtual-host addressing intentionally requires one
++// label only.
++func isVHostBucketLabel(s string) bool {
++	if strings.ContainsAny(s, "./") {
++		return false
++	}
++	return isValidBucketName(s)
++}
++
++// vhostBucketKeyType carries the bucket name the outer classifier extracted
++// from the Host header, from the router to the vhost mux's dispatch shim.
++type vhostBucketKeyType struct{}
++
++func withVHostBucket(ctx context.Context, bucket string) context.Context {
++	return context.WithValue(ctx, vhostBucketKeyType{}, bucket)
++}
++
++func vhostBucketFromContext(ctx context.Context) string {
++	bucket, _ := ctx.Value(vhostBucketKeyType{}).(string)
++	return bucket
++}
++
++// s3VHostHandlers holds the routes for virtual-host-style bucket requests,
++// served alongside the path-style s3Handlers. Patterns name only the key
++// (plus "/{$}" for bucket-root operations); the bucket itself is derived
++// from the Host header.
++var s3VHostHandlers = map[string]HandlerFunc{}
++
++// RegisterS3VHostHandleFunc registers a handler for virtual-host-style
++// requests. Patterns use Go 1.22 ServeMux syntax with no "{bucket}"
++// wildcard.
++func RegisterS3VHostHandleFunc(pattern string, handler HandlerFunc) {
++	registerHandler(s3VHostHandlers, "S3 virtual-host ", pattern, handler)
++}
++
++// buildVHostMux composes the vhost registry into an http.ServeMux. The mux
++// populates its own path values (the "{key...}" wildcard); each dispatch
++// shim then adds the bucket the outer classifier extracted from the Host.
++// The wire URL is never rewritten, so signature verification keeps seeing
++// the exact Host/path/query the client signed. cleanPath is applied with
++// the same traversal rules as the path-style mux; the health endpoint is
++// intentionally absent -- on a bucket host, a key equal to the health
++// path (e.g. "/healthz") is an object.
++func (s *Server) buildVHostMux(registry map[string]HandlerFunc, reject http.HandlerFunc) http.Handler {
++	mux := http.NewServeMux()
++	for pattern, handler := range registry {
++		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
++			r.SetPathValue("bucket", vhostBucketFromContext(r.Context()))
++			handler(s, w, r)
++		})
++	}
++	return cleanPathHandler(reject)(mux)
++}
++
++// virtualHostRouter routes each request according to matchBucketHost:
++// bucket hosts go to bucketHost, invalid hosts get a 400 S3 error, and the
++// service root plus unknown hosts keep the existing path-style chain.
++func virtualHostRouter(domain string, pathStyle, bucketHost http.Handler) http.Handler {
++	if domain == "" {
++		return pathStyle
++	}
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		bucket, mode := matchBucketHost(r.Host, domain)
++		switch mode {
++		case vhostBucket:
++			bucketHost.ServeHTTP(w, r.WithContext(withVHostBucket(r.Context(), bucket)))
++		case vhostInvalid:
++			WriteS3Error(w, r, "InvalidArgument",
++				"The bucket name encoded in the Host header is not valid; virtual-host-style addressing requires a single legal bucket label immediately before "+domain,
++				http.StatusBadRequest)
++		default:
++			pathStyle.ServeHTTP(w, r)
++		}
++	})
++}
+diff --git a/server/vhost_test.go b/server/vhost_test.go
+new file mode 100644
+index 0000000..de629fe
+--- /dev/null
++++ b/server/vhost_test.go
+@@ -0,0 +1,88 @@
++package server
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func TestMatchBucketHost(t *testing.T) {
++	const domain = "s3.local.test"
++
++	testCases := []struct {
++		caseName string
++		host     string
++		domain   string
++		want     vhostMode
++		bucket   string
++	}{
++		// Feature disabled: every Host is path-style.
++		{caseName: "no domain configured", host: "photos." + domain, domain: "", want: vhostPathStyle},
++
++		// Bucket hosts: port never matters.
++		{caseName: "bucket host", host: "photos." + domain, domain: domain, want: vhostBucket, bucket: "photos"},
++		{caseName: "bucket host with port", host: "photos." + domain + ":9000", domain: domain, want: vhostBucket, bucket: "photos"},
++		{caseName: "bucket host with other port", host: "photos." + domain + ":12345", domain: domain, want: vhostBucket, bucket: "photos"},
++		{caseName: "bucket host empty port", host: "photos." + domain + ":", domain: domain, want: vhostBucket, bucket: "photos"},
++		{caseName: "bucket with hyphen", host: "my-photos." + domain, domain: domain, want: vhostBucket, bucket: "my-photos"},
++
++		// Service root.
++		{caseName: "bare domain", host: domain, domain: domain, want: vhostServiceRoot},
++		{caseName: "bare domain with port", host: domain + ":9000", domain: domain, want: vhostServiceRoot},
++
++		// Trailing dots: never accepted, never path-style.
++		{caseName: "bucket host trailing dot", host: "photos." + domain + ".", domain: domain, want: vhostInvalid},
++		{caseName: "bucket host trailing dot with port", host: "photos." + domain + ".:9000", domain: domain, want: vhostInvalid},
++		{caseName: "bare domain trailing dot", host: domain + ".", domain: domain, want: vhostInvalid},
++		{caseName: "bare domain trailing dot with port", host: domain + ".:9000", domain: domain, want: vhostInvalid},
++		{caseName: "deeper name trailing dot", host: "a.photos." + domain + ".", domain: domain, want: vhostInvalid},
++
++		// Illegal bucket labels.
++		{caseName: "uppercase label", host: "Photos." + domain, domain: domain, want: vhostInvalid},
++		{caseName: "label too short", host: "a." + domain, domain: domain, want: vhostInvalid},
++		{caseName: "label two chars", host: "ab." + domain, domain: domain, want: vhostInvalid},
++		{caseName: "leading hyphen", host: "-photos." + domain, domain: domain, want: vhostInvalid},
++		{caseName: "dotted prefix", host: "my.photos." + domain, domain: domain, want: vhostInvalid},
++		{caseName: "double dot prefix", host: "ph..otos." + domain, domain: domain, want: vhostInvalid},
++		{caseName: "underscore label", host: "my_photos." + domain, domain: domain, want: vhostInvalid},
++		{caseName: "label too long", host: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa." + domain, domain: domain, want: vhostInvalid},
++
++		// Unknown hosts: deterministic path-style, bucket comes from the path.
++		{caseName: "lookalike without dot separator", host: "evils3.local.test", domain: domain, want: vhostPathStyle},
++		{caseName: "lookalike deeper name", host: "photos.s3.local.test.evil.com", domain: domain, want: vhostPathStyle},
++		{caseName: "domain as suffix of other domain", host: "s3.local.test.evil.com", domain: domain, want: vhostPathStyle},
++		{caseName: "localhost", host: "localhost:9000", domain: domain, want: vhostPathStyle},
++		{caseName: "ipv4", host: "127.0.0.1:9000", domain: domain, want: vhostPathStyle},
++		{caseName: "ipv6", host: "[::1]:9000", domain: domain, want: vhostPathStyle},
++		{caseName: "unrelated host", host: "evil.example.com", domain: domain, want: vhostPathStyle},
++	}
++	for _, tc := range testCases {
++		t.Run(tc.caseName, func(t *testing.T) {
++			bucket, mode := matchBucketHost(tc.host, tc.domain)
++			assert.Equal(t, tc.want, mode)
++			assert.Equal(t, tc.bucket, bucket)
++		})
++	}
++}
++
++func TestMatchBucketHostSingleLabelDomain(t *testing.T) {
++	testCases := []struct {
++		caseName string
++		host     string
++		want     vhostMode
++		bucket   string
++	}{
++		{caseName: "bucket host", host: "photos.s3", want: vhostBucket, bucket: "photos"},
++		{caseName: "bare root", host: "s3", want: vhostServiceRoot},
++		{caseName: "lookalike name", host: "evils3", want: vhostPathStyle},
++		{caseName: "trailing dot bucket", host: "photos.s3.", want: vhostInvalid},
++		{caseName: "trailing dot root", host: "s3.", want: vhostInvalid},
++	}
++	for _, tc := range testCases {
++		t.Run(tc.caseName, func(t *testing.T) {
++			bucket, mode := matchBucketHost(tc.host, "s3")
++			assert.Equal(t, tc.want, mode)
++			assert.Equal(t, tc.bucket, bucket)
++		})
++	}
++}

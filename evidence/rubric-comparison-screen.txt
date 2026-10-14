@@ -1,0 +1,11 @@
+项目：mojatter-s2-033abd7a-f406-42de-8381-423a832ddb25
+Session：55 rounds｜Trae｜1413 秒｜完成度：完成｜交付结论：不收录
+验证摘要：全部 workspace 模块执行 go test -count=1；关键路径执行重复与 race；未通过项另有可控对抗测试。
+
+Rubric ID：1｜状态：通过｜期望行为：默认关闭并兼容原路径、Console、CORS、健康与配置覆盖。｜实际观察：S3Domain 零值直接走 path-style，全模块测试通过。｜直接证据：vhost.go:48-50；s3api.go:59-64
+Rubric ID：2｜状态：通过｜期望行为：完整桶、对象、复制和 multipart 操作保持 Host 桶与原 key。｜实际观察：context 注入桶值；桶根、对象、复制、分片测试通过。｜直接证据：vhost.go:123-151；vhost_test.go
+Rubric ID：3｜状态：通过｜期望行为：header 与 presigned SigV4 使用客户端签署的 Host、path、query。｜实际观察：URL 未改写，合法签名及三类篡改拒绝测试通过。｜直接证据：vhost.go:115-131；签名篡改测试
+Rubric ID：4｜状态：通过｜期望行为：策略与复制源授权使用最终 bucket/key。｜实际观察：策略与 CopyObject 源授权定向测试通过。｜直接证据：sigv4.go:70-79；策略与复制测试
+Rubric ID：5｜状态：通过｜期望行为：裸域名保留列表和健康，桶域名健康路径作为对象。｜实际观察：裸域名健康与桶域名 healthz 对象测试通过。｜直接证据：s3api.go:63-64；健康隔离测试
+Rubric ID：6｜状态：通过｜期望行为：只接受精确后缀和合法单标签桶，其他 Host 结果确定。｜实际观察：端口、尾点、非法、多标签和未知 Host 测试通过。｜直接证据：vhost.go:48-86,137-153；Host 分类测试
+Rubric ID：7｜状态：通过｜期望行为：path-style、错误 XML、metadata/ETag、Console 和全库回归。｜实际观察：七个模块无缓存通过，vhost race 十次通过。｜直接证据：workspace 全量测试；race count=10

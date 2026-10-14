@@ -1,0 +1,11 @@
+项目：mojatter-s2-033abd7a-f406-42de-8381-423a832ddb25
+Session：55 rounds｜Trae｜1413 秒｜完成度：完成｜交付结论：不收录
+验证摘要：全部 workspace 模块执行 go test -count=1；关键路径执行重复与 race；未通过项另有可控对抗测试。
+
+Rubric ID：1｜状态：通过｜期望行为：虚拟主机能力默认关闭；未配置服务域名时，任意 Host 的现有 path-style S3 请求、Web Console、CORS 和健康检查保持固定版本行为，配置文件与环境覆盖规则也不会改变已有字段。｜实际观察：S3Domain 零值使分类器直接返回 path-style；全 workspace 模块无缓存测试通过。｜直接证据：server/vhost.go:48-50；server/s3api.go:59-64；workspace go test -count=1 全通过
+Rubric ID：2｜状态：通过｜期望行为：配置服务域名后，形如 photos.s3.local.test 的精确桶域名 Host 在 Create、Head、List、DeleteBucket、Put、Get、Copy、DeleteObject 及完整 multipart 生命周期中始终解析为 bucket photos 和未经错误折叠的原始 key，带端口和合法尾点时行为确定。｜实际观察：Host 桶值经请求 context 注入 PathValue，桶根、对象、复制和分片生命周期定向测试连续通过。｜直接证据：server/vhost.go:123-151；server/handlers/s3api/vhost_test.go 的 BucketRoot、CopyObject、MultipartLifecycle 通过
+Rubric ID：3｜状态：通过｜期望行为：Authorization header 与 presigned URL 的 SigV4 都按客户端实际签署的 Host、原始 path 和 query 验证；合法虚拟主机请求通过，签名后篡改 Host、编码路径或查询参数会稳定得到签名错误而不会转入 path-style 或匿名流程。｜实际观察：路由不改写 URL 或 RawQuery，Authorization 与 presigned 请求及 Host、path、query 篡改测试连续通过。｜直接证据：server/vhost.go:115-131；VHostSignedHostTamper、SignedPathTamper、SignedQueryTamper、PresignedURL 通过
+Rubric ID：4｜状态：通过｜期望行为：用户策略、匿名 principal 和 CopyObject 的源端二次授权均针对虚拟主机请求最终解析出的 bucket/key 执行，与等价 path-style 资源的允许和拒绝结果一致，不能通过 Host 形式越过前缀或跨桶限制。｜实际观察：鉴权读取同一 PathValue 资源，桶/键策略和跨桶复制源授权测试通过。｜直接证据：server/middleware/sigv4.go:70-79；VHostPolicyScopedToBucket、PolicyExactKeyWithSpace、CopyObject 通过
+Rubric ID：5｜状态：通过｜期望行为：服务域名根路径仍可 ListBuckets 并提供配置的健康检查；桶域名下与健康路径同名的 key 进入对象处理，健康中间件不会遮蔽或伪造该对象结果。｜实际观察：裸服务域名保留 ListBuckets 与健康入口，桶域名的 healthz 实际读取同名对象。｜直接证据：server/s3api.go:63-64；VHostServiceRootListBucketsAndHealth、VHostHealthNamedKeyIsObject 通过
+Rubric ID：6｜状态：通过｜期望行为：仅精确匹配配置后缀且前缀是合法单段桶名的 Host 会启用虚拟主机寻址；空前缀、多标签歧义、非法桶标签、错误后缀和未知 Host 不会被悄悄映射到另一桶，并返回可重复的兼容路由或明确 4xx。｜实际观察：分类器仅接受合法单标签桶前缀；端口被剥离，尾点、非法和多标签前缀返回 400，未知 Host 保留 path-style。｜直接证据：server/vhost.go:48-86、137-153；MatchBucketHost、VHostInvalidHosts、VHostObjectPortStripped 通过
+Rubric ID：7｜状态：通过｜期望行为：现有 path-style 的普通、复制、分片和预签名工作流以及 S3 错误 XML、对象 metadata/ETag、控制台独立监听器和仓库既有测试保持回归通过。｜实际观察：根模块及 azblob、cmd、gcs、s2env、s3、server 全模块无缓存通过，vhost 关键路径 race 重复十次通过。｜直接证据：七个 workspace module 的 go test -count=1 ./... 全通过；vhost 关键测试 go test -race -count=10 通过

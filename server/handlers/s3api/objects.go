@@ -758,4 +758,13 @@ func init() {
 	server.RegisterS3HandleFunc("HEAD /{bucket}/{key...}", middleware.SigV4(handleGetObject))
 	server.RegisterS3HandleFunc("PUT /{bucket}/{key...}", middleware.SigV4(handlePutObject))
 	server.RegisterS3HandleFunc("DELETE /{bucket}/{key...}", middleware.SigV4(handleDeleteObject))
+
+	// Virtual-host-style: the bucket comes from the Host and the single
+	// "/{key...}" pattern covers both objects and bucket-root operations via
+	// the empty-key delegation above (GET "/" lists objects, PUT "/" creates
+	// the bucket, and so on), mirroring path-style trailing-slash requests.
+	server.RegisterS3VHostHandleFunc("GET /{key...}", middleware.SigV4(handleGetObject))
+	server.RegisterS3VHostHandleFunc("HEAD /{key...}", middleware.SigV4(handleGetObject))
+	server.RegisterS3VHostHandleFunc("PUT /{key...}", middleware.SigV4(handlePutObject))
+	server.RegisterS3VHostHandleFunc("DELETE /{key...}", middleware.SigV4(handleDeleteObject))
 }

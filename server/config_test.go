@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -466,4 +467,62 @@ func TestConfigValidateUsers(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNormalizeS3Domain(t *testing.T) {
+	testCases := []struct {
+		caseName string
+		in       string
+		want     string
+		wantErr  bool
+	}{
+		{caseName: "plain domain", in: "s3.local.test", want: "s3.local.test"},
+		{caseName: "uppercase normalized", in: "S3.LOCAL.TEST", want: "s3.local.test"},
+		{caseName: "fqdn trailing dot stripped", in: "s3.local.test.", want: "s3.local.test"},
+		{caseName: "http url", in: "http://s3.local.test:9000/", want: "s3.local.test"},
+		{caseName: "https url with path", in: "https://s3.local.test/some/path", want: "s3.local.test"},
+		{caseName: "url with query", in: "http://s3.local.test?q=1", want: "s3.local.test"},
+		{caseName: "whitespace trimmed", in: "  s3.local.test  ", want: "s3.local.test"},
+		{caseName: "single label", in: "s3", want: "s3"},
+		{caseName: "numeric label", in: "s3.10", want: "s3.10"},
+
+		{caseName: "empty rejected", in: "", wantErr: true},
+		{caseName: "only dot rejected", in: ".", wantErr: true},
+		{caseName: "leading dot rejected", in: ".local.test", wantErr: true},
+		{caseName: "empty middle label rejected", in: "a..b.test", wantErr: true},
+		{caseName: "leading hyphen label rejected", in: "-bad.test", wantErr: true},
+		{caseName: "trailing hyphen label rejected", in: "bad-.test", wantErr: true},
+		{caseName: "underscore rejected", in: "s3_local.test", wantErr: true},
+		{caseName: "illegal char rejected", in: "s3!.local.test", wantErr: true},
+		{caseName: "label too long rejected", in: strings.Repeat("a", 64) + ".test", wantErr: true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.caseName, func(t *testing.T) {
+			got, err := normalizeS3Domain(tc.in)
+			if tc.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestValidateS3DomainNormalizedInPlace(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.S3Domain = "https://S3.LOCAL.TEST.:9000/"
+	require.NoError(t, cfg.Validate())
+	assert.Equal(t, "s3.local.test", cfg.S3Domain)
+
+	cfg = DefaultConfig()
+	cfg.S3Domain = "s3_local.test"
+	assert.Error(t, cfg.Validate())
+}
+
+func TestLoadEnvS3Domain(t *testing.T) {
+	t.Setenv(EnvS2ServerS3Domain, "s3.local.test")
+	cfg := DefaultConfig()
+	require.NoError(t, cfg.LoadEnv())
+	assert.Equal(t, "s3.local.test", cfg.S3Domain)
 }

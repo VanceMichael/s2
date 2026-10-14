@@ -549,4 +549,5 @@ func handleObjectPOST(s *server.Server, w http.ResponseWriter, r *http.Request) 
 
 func init() {
 	server.RegisterS3HandleFunc("POST /{bucket}/{key...}", middleware.SigV4(handleObjectPOST))
+	server.RegisterS3VHostHandleFunc("POST /{key...}", middleware.SigV4(handleObjectPOST))
 }

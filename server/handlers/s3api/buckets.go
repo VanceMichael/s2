@@ -176,4 +176,8 @@ func init() {
 	server.RegisterS3HandleFunc("PUT /{bucket}", middleware.SigV4(handleCreateBucket))
 	server.RegisterS3HandleFunc("DELETE /{bucket}", middleware.SigV4(handleDeleteBucket))
 	server.RegisterS3HandleFunc("HEAD /{bucket}", middleware.SigV4(handleHeadBucket))
+
+	// Virtual-host-style has no root "{/$}" pattern: "/{key...}" also matches
+	// zero segments and the object handlers' existing empty-key delegation
+	// runs the bucket-root operation (see objects.go/multipart.go).
 }

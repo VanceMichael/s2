@@ -49,11 +49,19 @@ var s3Handlers = map[string]HandlerFunc{}
 // S3Handler builds an HTTP handler that serves the S3-compatible API:
 // routes registered via RegisterS3HandleFunc, wrapped with the health
 // endpoint at cfg.HealthPath (when set) and permissive CORS headers.
+//
+// When cfg.S3Domain is set, virtual-host-style bucket requests
+// ("<bucket>.<domain>/<key>") are dispatched to the vhost registry before
+// the path-style chain; the bare domain and unknown hosts keep the chain
+// below unchanged. When it is empty the router passes every request
+// straight through, so the unconfigured chain is byte-for-byte the
+// previous one.
 func (s *Server) S3Handler() http.Handler {
 	reject := func(w http.ResponseWriter, r *http.Request) {
 		WriteS3Error(w, r, "InvalidArgument", "The request path is not valid", http.StatusBadRequest)
 	}
-	return s.buildMux(s3Handlers, cleanPathHandler(reject), healthHandler(s.Config.HealthPath), corsHandler)
+	pathStyle := s.buildMux(s3Handlers, cleanPathHandler(reject), healthHandler(s.Config.HealthPath))
+	return corsHandler(virtualHostRouter(s.Config.S3Domain, pathStyle, s.buildVHostMux(s3VHostHandlers, reject)))
 }
 
 // cleanPathHandler answers with reject when the request path is not already
