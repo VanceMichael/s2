@@ -1,0 +1,2099 @@
+diff --git a/server/handlers/s3api/models.go b/server/handlers/s3api/models.go
+index ace014d..a205fe8 100644
+--- a/server/handlers/s3api/models.go
++++ b/server/handlers/s3api/models.go
+@@ -63,6 +63,17 @@ type CopyObjectResult struct {
+ 	ETag         string    `xml:"ETag,omitempty"`
+ }
+ 
++// PostResponse represents the XML response for a presigned POST upload that
++// set success_action_status=201. Location/Bucket/Key/ETag all describe the
++// object that was actually written.
++type PostResponse struct {
++	XMLName  xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ PostResponse"`
++	Location string   `xml:"Location"`
++	Bucket   string   `xml:"Bucket"`
++	Key      string   `xml:"Key"`
++	ETag     string   `xml:"ETag,omitempty"`
++}
++
+ // LocationConstraint represents the XML response for GetBucketLocation.
+ type LocationConstraint struct {
+ 	XMLName  xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ LocationConstraint"`
+diff --git a/server/handlers/s3api/multipart.go b/server/handlers/s3api/multipart.go
+index b5a4a3b..7c9fdbe 100644
+--- a/server/handlers/s3api/multipart.go
++++ b/server/handlers/s3api/multipart.go
+@@ -526,15 +526,28 @@ func (p *partsReader) Close() error {
+ 	return nil
+ }
+ 
+-func handleObjectPOST(s *server.Server, w http.ResponseWriter, r *http.Request) {
+-	// A trailing-slash bucket request (e.g. "POST /my-bucket/?delete")
+-	// routes to this pattern with an empty key. Delegate to the
+-	// bucket-level POST handler so DeleteObjects continues to work.
++// objectPOSTWithSigV4 is the unchanged SigV4-wrapped object POST handler
++// (CreateMultipartUpload/CompleteMultipartUpload/ListParts routing);
++// hoisted so the entry dispatcher does not rebuild the wrapper per request.
++var objectPOSTWithSigV4 = middleware.SigV4(handleObjectPOST)
++
++func handleObjectPOSTEntry(s *server.Server, w http.ResponseWriter, r *http.Request) {
++	// A trailing-slash bucket request (e.g. "POST /my-bucket/?delete", or a
++	// browser presigned POST to "POST /my-bucket/") routes here with an empty
++	// key. The bucket entry chooses between form-based POST authentication
++	// and the header/query SigV4 path itself, so it must run outside this
++	// route's SigV4 wrapper or an unsigned browser form would be rejected as
++	// anonymous before its signature is read.
+ 	if r.PathValue("key") == "" {
+-		handleBucketPOST(s, w, r)
++		handleBucketPOSTEntry(s, w, r)
+ 		return
+ 	}
++	objectPOSTWithSigV4(s, w, r)
++}
+ 
++func handleObjectPOST(s *server.Server, w http.ResponseWriter, r *http.Request) {
++	// Empty-key (trailing-slash) bucket POSTs are intercepted by
++	// handleObjectPOSTEntry before this SigV4-wrapped handler runs.
+ 	q := r.URL.Query()
+ 	if _, ok := q["uploads"]; ok {
+ 		handleCreateMultipartUpload(s, w, r)
+@@ -548,5 +561,5 @@ func handleObjectPOST(s *server.Server, w http.ResponseWriter, r *http.Request)
+ }
+ 
+ func init() {
+-	server.RegisterS3HandleFunc("POST /{bucket}/{key...}", middleware.SigV4(handleObjectPOST))
++	server.RegisterS3HandleFunc("POST /{bucket}/{key...}", handleObjectPOSTEntry)
+ }
+diff --git a/server/handlers/s3api/objects.go b/server/handlers/s3api/objects.go
+index 6eff83c..8e4a718 100644
+--- a/server/handlers/s3api/objects.go
++++ b/server/handlers/s3api/objects.go
+@@ -753,7 +753,7 @@ func handleBucketGET(s *server.Server, w http.ResponseWriter, r *http.Request) {
+ 
+ func init() {
+ 	server.RegisterS3HandleFunc("GET /{bucket}", middleware.SigV4(handleBucketGET))
+-	server.RegisterS3HandleFunc("POST /{bucket}", middleware.SigV4(handleBucketPOST))
++	server.RegisterS3HandleFunc("POST /{bucket}", handleBucketPOSTEntry)
+ 	server.RegisterS3HandleFunc("GET /{bucket}/{key...}", middleware.SigV4(handleGetObject))
+ 	server.RegisterS3HandleFunc("HEAD /{bucket}/{key...}", middleware.SigV4(handleGetObject))
+ 	server.RegisterS3HandleFunc("PUT /{bucket}/{key...}", middleware.SigV4(handlePutObject))
+diff --git a/server/handlers/s3api/postobject.go b/server/handlers/s3api/postobject.go
+new file mode 100644
+index 0000000..b431121
+--- /dev/null
++++ b/server/handlers/s3api/postobject.go
+@@ -0,0 +1,688 @@
++package s3api
++
++// Browser-based presigned POST uploads: POST /{bucket} with an
++// AWS SigV4 multipart/form-data form. Unlike DeleteObjects on the same
++// route, these carry no Authorization header: the signature is a form
++// field computed over the base64 policy, the identity is the form's
++// x-amz-credential, and every other field must be pinned by a policy
++// condition. See handlePostObject for the full verification order.
++
++import (
++	"bytes"
++	"encoding/base64"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"math"
++	"mime"
++	"mime/multipart"
++	"net/http"
++	"net/url"
++	"os"
++	"slices"
++	"strings"
++	"time"
++
++	"github.com/mojatter/s2"
++	"github.com/mojatter/s2/server"
++	"github.com/mojatter/s2/server/middleware"
++)
++
++const (
++	// postFormOverhead bounds what multipart framing, the signing fields and
++	// every other text field may add on top of the file itself when capping
++	// the whole request body.
++	postFormOverhead = 1 << 20
++	// maxPostFieldBytes caps a single non-file form value. A POST policy is
++	// limited by S3 to roughly 20 KiB before base64, so 64 KiB is generous
++	// without letting an unconstrained field grow memory.
++	maxPostFieldBytes = 64 << 10
++	// maxPostFields bounds the number of distinct text fields, independently
++	// of their size.
++	maxPostFields = 256
++
++	contentTypeField = "Content-Type"
++	metaFieldPrefix  = "x-amz-meta-"
++	fileFieldName    = "file"
++	filenameVar      = "${filename}"
++)
++
++// postExemptFields names form fields that never need a policy condition:
++// the key, the SigV4 signing fields, STS tokens (s2 has no STS but accepts
++// and ignores the field rather than failing an SDK that sends one), and the
++// success-action selectors. "file" is not a text field at all.
++var postExemptFields = map[string]bool{
++	"key":                     true,
++	"policy":                  true,
++	"x-amz-algorithm":         true,
++	"x-amz-credential":        true,
++	"x-amz-date":              true,
++	"x-amz-signature":         true,
++	"x-amz-security-token":    true,
++	"success_action_redirect": true,
++	"success_action_status":   true,
++}
++
++// postError is a failed presigned POST with the exact S3 error shape the
++// client must receive.
++type postError struct {
++	code   string
++	msg    string
++	status int
++}
++
++func (e *postError) Error() string { return e.code + ": " + e.msg }
++
++func postInvalid(format string, args ...any) *postError {
++	return &postError{"InvalidArgument", fmt.Sprintf(format, args...), http.StatusBadRequest}
++}
++
++func postDenied(msg string) *postError {
++	return &postError{"AccessDenied", msg, http.StatusForbidden}
++}
++
++// isPresignedPostUpload reports whether a bucket-level POST request is a
++// browser-style presigned POST rather than a SigV4-authenticated bucket
++// operation (DeleteObjects). The signature lives inside the multipart body,
++// so any Authorization header or presigned-URL query parameter keeps the
++// request on the header/query SigV4 path unchanged.
++func isPresignedPostUpload(r *http.Request) bool {
++	if r.URL.Query().Has("delete") {
++		return false
++	}
++	if r.Header.Get("Authorization") != "" || r.URL.Query().Get("X-Amz-Algorithm") != "" {
++		return false
++	}
++	mediaType, _, err := mime.ParseMediaType(requestContentType(r))
++	return err == nil && mediaType == "multipart/form-data"
++}
++
++// bucketPOSTWithSigV4 is the unchanged SigV4-wrapped bucket POST handler
++// (DeleteObjects and the NotImplemented fallback); hoisted so the
++// dispatcher does not rebuild the wrapper on every request.
++var bucketPOSTWithSigV4 = middleware.SigV4(handleBucketPOST)
++
++// handleBucketPOSTEntry is the registered bucket-level POST dispatcher. It
++// routes presigned POST uploads to their form-based authentication and all
++// other bucket POSTs (today: DeleteObjects) through the unchanged SigV4
++// middleware.
++func handleBucketPOSTEntry(s *server.Server, w http.ResponseWriter, r *http.Request) {
++	if isPresignedPostUpload(r) {
++		handlePostObject(s, w, r)
++		return
++	}
++	bucketPOSTWithSigV4(s, w, r)
++}
++
++// canonicalPostField canonicalizes a form field or policy condition name:
++// the MIME type is spelled "Content-Type" regardless of client casing, and
++// every x-amz-meta-* name is lowercased (matching how PutObject stores
++// metadata). Other names keep their exact spelling.
++func canonicalPostField(name string) string {
++	if strings.EqualFold(name, contentTypeField) {
++		return contentTypeField
++	}
++	if len(name) > len(metaFieldPrefix) && strings.EqualFold(name[:len(metaFieldPrefix)], metaFieldPrefix) {
++		return metaFieldPrefix + strings.ToLower(name[len(metaFieldPrefix):])
++	}
++	return name
++}
++
++// readPostForm streams the multipart body up to (but not including) the file
++// part. Text field values are collected in full; duplicates are rejected.
++// The caller keeps mr to spool the file body and to confirm the file is the
++// form's last part.
++func readPostForm(mr *multipart.Reader) (fields map[string]string, file *multipart.Part, perr *postError) {
++	fields = make(map[string]string)
++	for {
++		part, err := mr.NextPart()
++		if errors.Is(err, io.EOF) {
++			return fields, nil, nil
++		}
++		if err != nil {
++			if isRequestBodyTooLarge(err) {
++				return nil, nil, &postError{"EntityTooLarge", "Your proposed upload exceeds the maximum allowed size", http.StatusBadRequest}
++			}
++			return nil, nil, postInvalid("Malformed multipart/form-data POST request: %v", err)
++		}
++		if part.FormName() == fileFieldName {
++			return fields, part, nil
++		}
++		data, err := io.ReadAll(io.LimitReader(part, maxPostFieldBytes+1))
++		_ = part.Close()
++		if err != nil {
++			return nil, nil, postInvalid("Malformed multipart/form-data POST request: %v", err)
++		}
++		if len(data) > maxPostFieldBytes {
++			return nil, nil, postInvalid("Form field %q exceeds the maximum size of %d bytes", part.FormName(), maxPostFieldBytes)
++		}
++		name := canonicalPostField(part.FormName())
++		if _, dup := fields[name]; dup {
++			return nil, nil, postInvalid("Duplicate form field %q", name)
++		}
++		if len(fields) >= maxPostFields {
++			return nil, nil, postInvalid("POST form carries more than %d fields", maxPostFields)
++		}
++		fields[name] = string(data)
++	}
++}
++
++func isRequestBodyTooLarge(err error) bool {
++	var maxErr *http.MaxBytesError
++	return errors.As(err, &maxErr) || strings.Contains(err.Error(), "http: request body too large")
++}
++
++// postPolicyDoc is the decoded POST policy.
++type postPolicyDoc struct {
++	Expiration string            `json:"expiration"`
++	Conditions []json.RawMessage `json:"conditions"`
++}
++
++// postCondition is one validated policy condition.
++type postCondition struct {
++	op      string // "eq", "starts-with", "content-length-range"
++	field   string // canonical field name ("bucket", "key", "Content-Type", "x-amz-meta-*")
++	value   string // eq / starts-with
++	minSize int64  // content-length-range
++	maxSize int64
++}
++
++// parsePostPolicy base64-decodes and JSON-parses the policy field exactly as
++// submitted (the signature was computed over that exact base64 string).
++func parsePostPolicy(policyB64 string) (*postPolicyDoc, *postError) {
++	raw, err := base64.StdEncoding.DecodeString(policyB64)
++	if err != nil {
++		return nil, postInvalid("Policy is not valid base64: %v", err)
++	}
++	var doc postPolicyDoc
++	dec := json.NewDecoder(bytes.NewReader(raw))
++	dec.DisallowUnknownFields()
++	if err := dec.Decode(&doc); err != nil {
++		return nil, postInvalid("Policy is not valid JSON: %v", err)
++	}
++	if doc.Expiration == "" {
++		return nil, postInvalid("Policy is missing the expiration element")
++	}
++	if len(doc.Conditions) == 0 {
++		return nil, postInvalid("Policy is missing the conditions element")
++	}
++	return &doc, nil
++}
++
++// parsePostConditions turns the raw JSON conditions into validated
++// postCondition values.
++func parsePostConditions(doc *postPolicyDoc) ([]postCondition, *postError) {
++	conds := make([]postCondition, 0, len(doc.Conditions))
++	for i, raw := range doc.Conditions {
++		// Short form: {"bucket": "name"}.
++		var obj map[string]json.RawMessage
++		if err := json.Unmarshal(raw, &obj); err == nil {
++			if len(obj) != 1 {
++				return nil, postInvalid("Policy conditions[%d] must name exactly one field", i)
++			}
++			var name, value string
++			for k, v := range obj {
++				name = k
++				if err := json.Unmarshal(v, &value); err != nil {
++					return nil, postInvalid("Policy conditions[%d]: %v", i, err)
++				}
++			}
++			cond, perr := newMatchCondition(i, "eq", "$"+name, value)
++			if perr != nil {
++				return nil, perr
++			}
++			conds = append(conds, cond)
++			continue
++		}
++		var arr []json.RawMessage
++		if err := json.Unmarshal(raw, &arr); err != nil {
++			return nil, postInvalid("Policy conditions[%d] must be an array or an object", i)
++		}
++		if len(arr) == 0 {
++			return nil, postInvalid("Policy conditions[%d] is empty", i)
++		}
++		var op string
++		if err := json.Unmarshal(arr[0], &op); err != nil {
++			return nil, postInvalid("Policy conditions[%d]: %v", i, err)
++		}
++		switch op {
++		case "eq", "starts-with":
++			if len(arr) != 3 {
++				return nil, postInvalid("Policy conditions[%d]: %q requires a field reference and a value", i, op)
++			}
++			var ref, value string
++			if err := json.Unmarshal(arr[1], &ref); err != nil {
++				return nil, postInvalid("Policy conditions[%d]: %v", i, err)
++			}
++			if err := json.Unmarshal(arr[2], &value); err != nil {
++				return nil, postInvalid("Policy conditions[%d]: %v", i, err)
++			}
++			cond, perr := newMatchCondition(i, op, ref, value)
++			if perr != nil {
++				return nil, perr
++			}
++			conds = append(conds, cond)
++		case "content-length-range":
++			if len(arr) != 3 {
++				return nil, postInvalid("Policy conditions[%d]: content-length-range requires a minimum and maximum", i)
++			}
++			minSize, err := jsonNumberInt64(arr[1])
++			if err != nil {
++				return nil, postInvalid("Policy conditions[%d]: invalid range minimum: %v", i, err)
++			}
++			maxSize, err := jsonNumberInt64(arr[2])
++			if err != nil {
++				return nil, postInvalid("Policy conditions[%d]: invalid range maximum: %v", i, err)
++			}
++			if minSize < 0 || maxSize < 0 || minSize > maxSize {
++				return nil, postInvalid("Policy conditions[%d]: invalid content-length-range %d-%d", i, minSize, maxSize)
++			}
++			conds = append(conds, postCondition{op: op, minSize: minSize, maxSize: maxSize})
++		default:
++			return nil, postInvalid("Policy conditions[%d]: unsupported operator %q", i, op)
++		}
++	}
++	return conds, nil
++}
++
++// newMatchCondition validates one eq/starts-with condition: the reference
++// must name a field s2 evaluates, and must use the "$field" form.
++func newMatchCondition(i int, op, ref, value string) (postCondition, *postError) {
++	if !strings.HasPrefix(ref, "$") || ref == "$" {
++		return postCondition{}, postInvalid("Policy conditions[%d]: field reference %q must start with %q", i, ref, "$")
++	}
++	field := canonicalPostField(strings.TrimPrefix(ref, "$"))
++	switch {
++	case field == "bucket" || field == "key" || field == contentTypeField:
++	case strings.HasPrefix(field, metaFieldPrefix):
++	default:
++		return postCondition{}, postInvalid("Policy conditions[%d]: unsupported field %q", i, ref)
++	}
++	return postCondition{op: op, field: field, value: value}, nil
++}
++
++func jsonNumberInt64(raw json.RawMessage) (int64, error) {
++	var n json.Number
++	if err := json.Unmarshal(raw, &n); err != nil {
++		return 0, err
++	}
++	return n.Int64()
++}
++
++// evaluatedPolicy holds the size bounds the conditions pin down.
++type evaluatedPolicy struct {
++	minSize int64 // 0 = no lower bound
++	maxSize int64 // math.MaxInt64 = no upper bound
++}
++
++// evaluatePostPolicy checks every condition against the actual submitted
++// values and the expanded key, and guarantees every non-exempt submitted
++// field is pinned by at least one condition. The file size itself is
++// checked by the caller after spooling; only the bounds are resolved here.
++func evaluatePostPolicy(conds []postCondition, fields map[string]string, bucket, key string) (*evaluatedPolicy, *postError) {
++	hasBucketCondition := false
++	covered := make(map[string]bool)
++	ev := &evaluatedPolicy{minSize: 0, maxSize: math.MaxInt64}
++
++	for i, cond := range conds {
++		if cond.op == "content-length-range" {
++			// All ranges must contain the actual size; intersect them. A
++			// pair that leaves no possible size is a contradiction, not a
++			// condition the upload can satisfy.
++			ev.minSize = max(ev.minSize, cond.minSize)
++			ev.maxSize = min(ev.maxSize, cond.maxSize)
++			if ev.minSize > ev.maxSize {
++				return nil, postDenied(fmt.Sprintf("Invalid according to Policy: Policy Condition failed at conditions[%d]: contradictory content-length-range", i))
++			}
++			continue
++		}
++
++		covered[cond.field] = true
++		var actual string
++		switch cond.field {
++		case "bucket":
++			hasBucketCondition = true
++			actual = bucket
++		case "key":
++			actual = key
++		default:
++			var present bool
++			actual, present = fields[cond.field]
++			if !present {
++				return nil, postDenied(fmt.Sprintf("Invalid according to Policy: Policy Condition failed at conditions[%d]: field %q is missing from the POST", i, cond.field))
++			}
++		}
++		if !matchPostCondition(cond, actual) {
++			return nil, postDenied(fmt.Sprintf("Invalid according to Policy: Policy Condition failed at conditions[%d]: %s %q", i, cond.op, cond.value))
++		}
++	}
++
++	if !hasBucketCondition {
++		return nil, postInvalid("Policy must contain a condition that pins the bucket")
++	}
++
++	// Every submitted field other than the exempt signing/control fields and
++	// the file must be constrained; an extra field can never widen an upload.
++	for name := range fields {
++		if postExemptFields[name] || covered[name] {
++			continue
++		}
++		return nil, postDenied(fmt.Sprintf("Invalid according to Policy: Extra input field not allowed: [%s]", name))
++	}
++
++	return ev, nil
++}
++
++func matchPostCondition(cond postCondition, actual string) bool {
++	switch cond.op {
++	case "eq":
++		return actual == cond.value
++	case "starts-with":
++		return strings.HasPrefix(actual, cond.value)
++	default:
++		return false
++	}
++}
++
++// parsePostExpiration parses S3's ISO-8601 policy expiration.
++func parsePostExpiration(s string) (time.Time, error) {
++	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05.000Z"} {
++		if t, err := time.Parse(layout, s); err == nil {
++			return t, nil
++		}
++	}
++	return time.Time{}, fmt.Errorf("invalid expiration %q", s)
++}
++
++func handlePostObject(s *server.Server, w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	bucket := r.PathValue("bucket")
++	serverMaxSize := s.Config.EffectiveMaxUploadSize()
++
++	_, params, err := mime.ParseMediaType(requestContentType(r))
++	if err != nil || params["boundary"] == "" {
++		writeError(w, r, "InvalidArgument", "POST uploads must use multipart/form-data with a boundary", http.StatusBadRequest)
++		return
++	}
++
++	// The whole-request backstop counts framing too; the file itself is
++	// capped separately by its own byte count below.
++	totalLimit := serverMaxSize + min(postFormOverhead, math.MaxInt64-serverMaxSize)
++	if r.ContentLength > totalLimit {
++		writeEntityTooLarge(w, r, serverMaxSize)
++		return
++	}
++	r.Body = http.MaxBytesReader(w, r.Body, totalLimit)
++
++	mr := multipart.NewReader(r.Body, params["boundary"])
++	fields, filePart, perr := readPostForm(mr)
++	if perr != nil {
++		writeError(w, r, perr.code, perr.msg, perr.status)
++		return
++	}
++	if filePart == nil {
++		writeError(w, r, "InvalidArgument", "POST requires a file upload in the %q field", http.StatusBadRequest)
++		return
++	}
++	filename := filePart.FileName()
++
++	rawKey := fields["key"]
++	if rawKey == "" {
++		writeError(w, r, "InvalidArgument", "Key field missing in POST", http.StatusBadRequest)
++		return
++	}
++	// ${filename} is the only variable, and only the upload's file name may
++	// replace it; every other ${...} token stays literal.
++	key := strings.ReplaceAll(rawKey, filenameVar, filename)
++	if err := s2.ValidateName(key); err != nil {
++		writeError(w, r, "InvalidArgument", err.Error(), http.StatusBadRequest)
++		return
++	}
++
++	if perr := validateSuccessAction(fields); perr != nil {
++		writeError(w, r, perr.code, perr.msg, perr.status)
++		return
++	}
++	if _, ok := fields[metaFieldPrefix+reservedETagKey]; ok {
++		writeError(w, r, "InvalidArgument", "Metadata key %q is reserved", http.StatusBadRequest)
++		return
++	}
++
++	authEnabled := s.Config.AuthEnabled()
++	var user *server.User
++	var policy *postPolicyDoc
++
++	if policyB64, signed := fields["policy"]; signed || authEnabled {
++		if policyB64 == "" {
++			writeError(w, r, "AccessDenied", "Invalid according to Policy: Policy missing in the form post", http.StatusForbidden)
++			return
++		}
++		doc, perr := parsePostPolicy(policyB64)
++		if perr != nil {
++			writeError(w, r, perr.code, perr.msg, perr.status)
++			return
++		}
++		if authEnabled {
++			lookup := func(accessKeyID string) (*server.User, bool) {
++				u := s.Config.LookupUser(accessKeyID)
++				return u, u != nil
++			}
++			matched, verr := middleware.VerifyPostPolicyV4(lookup, middleware.PostPolicyFields{
++				Algorithm:  fields["x-amz-algorithm"],
++				Credential: fields["x-amz-credential"],
++				Date:       fields["x-amz-date"],
++				Policy:     policyB64,
++				Signature:  fields["x-amz-signature"],
++			})
++			if verr != nil {
++				writeError(w, r, "SignatureDoesNotMatch", verr.Error(), http.StatusForbidden)
++				return
++			}
++			user = matched
++		}
++		expiration, err := parsePostExpiration(doc.Expiration)
++		if err != nil {
++			writeError(w, r, "InvalidArgument", err.Error(), http.StatusBadRequest)
++			return
++		}
++		if time.Now().UTC().After(expiration) {
++			writeError(w, r, "AccessDenied", "Invalid according to Policy: Policy expired", http.StatusForbidden)
++			return
++		}
++		policy = doc
++	}
++
++	var eval *evaluatedPolicy
++	if policy != nil {
++		conds, perr := parsePostConditions(policy)
++		if perr != nil {
++			writeError(w, r, perr.code, perr.msg, perr.status)
++			return
++		}
++		eval, perr = evaluatePostPolicy(conds, fields, bucket, key)
++		if perr != nil {
++			writeError(w, r, perr.code, perr.msg, perr.status)
++			return
++		}
++	} else {
++		// Auth disabled and no policy supplied: no conditions, the server
++		// upload limit still bounds the file.
++		eval = &evaluatedPolicy{minSize: 0, maxSize: math.MaxInt64}
++	}
++
++	// Authenticate the principal against the finally-expanded resource, like
++	// header/query SigV4 does for PutObject.
++	if !server.AllowedS3Action(user, server.ActionPutObject, bucket, key) {
++		writeError(w, r, "AccessDenied", "Access Denied", http.StatusForbidden)
++		return
++	}
++
++	strg, err := s.Buckets.Get(ctx, bucket)
++	if err != nil {
++		code, msg, status := s2ErrorToS3Error(err)
++		writeError(w, r, code, msg, status)
++		return
++	}
++
++	// The server-wide upload limit always applies on top of any policy range.
++	fileCap := min(serverMaxSize, eval.maxSize)
++	tmp, size, perr := spoolPostFile(filePart, fileCap)
++	if perr != nil {
++		writeError(w, r, perr.code, perr.msg, perr.status)
++		return
++	}
++	defer func() { _ = os.Remove(tmp.Name()) }()
++	defer func() { _ = tmp.Close() }()
++
++	if size < eval.minSize {
++		writeError(w, r, "EntityTooSmall", fmt.Sprintf("Your proposed upload is smaller than the minimum allowed size (%d bytes)", eval.minSize), http.StatusBadRequest)
++		return
++	}
++
++	// The file must be the form's last part: anything after it is ignored by
++	// a lenient parser and must not widen the request.
++	switch trailing, terr := mr.NextPart(); {
++	case terr == nil:
++		_ = trailing.Close()
++		writeError(w, r, "InvalidArgument", "The %q field must be the last field in the POST form", http.StatusBadRequest)
++		return
++	case errors.Is(terr, io.EOF):
++	default:
++		if isRequestBodyTooLarge(terr) {
++			writeEntityTooLarge(w, r, serverMaxSize)
++			return
++		}
++		writeError(w, r, "IncompleteBody", "The request body terminated before the multipart closing boundary", http.StatusBadRequest)
++		return
++	}
++
++	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
++		writeError(w, r, "InternalError", err.Error(), http.StatusInternalServerError)
++		return
++	}
++
++	obj := s2.NewObjectReader(key, tmp, s2.MustUint64(size),
++		s2.WithContentType(fields[contentTypeField]), s2.WithMetadata(postMetadata(fields)))
++	res, err := s2.Upload(ctx, strg, obj, s2.UploadOptions{})
++	if err != nil {
++		code, msg, status := uploadErrorToS3Error(err)
++		writeError(w, r, code, msg, status)
++		return
++	}
++
++	writePostSuccess(w, r, fields, bucket, key, filename, res.ETag)
++}
++
++// validateSuccessAction validates the optional success_action_* selectors up
++// front, so a bad value fails before any byte is stored.
++func validateSuccessAction(fields map[string]string) *postError {
++	if status := fields["success_action_status"]; status != "" {
++		if !slices.Contains([]string{"200", "201", "204"}, status) {
++			return postInvalid("success_action_status must be 200, 201, or 204, got %q", status)
++		}
++	}
++	if redirect := fields["success_action_redirect"]; redirect != "" {
++		u, err := url.Parse(redirect)
++		if err != nil || !u.IsAbs() || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
++			return postInvalid("success_action_redirect must be an absolute http(s) URL, got %q", redirect)
++		}
++	}
++	return nil
++}
++
++// postMetadata gathers the submitted x-amz-meta-* fields as object metadata.
++// The reserved s2-etag key has already been rejected.
++func postMetadata(fields map[string]string) s2.Metadata {
++	md := make(s2.Metadata)
++	for name, value := range fields {
++		if strings.HasPrefix(name, metaFieldPrefix) {
++			md[name[len(metaFieldPrefix):]] = value
++		}
++	}
++	return md
++}
++
++// spoolPostFile copies the file part into a temp file, enforcing cap. The
++// storage write never starts until the whole file has been received and
++// measured, so a truncated or oversized stream cannot touch an existing
++// object; the caller removes the temp file after the write.
++func spoolPostFile(part *multipart.Part, cap int64) (*os.File, int64, *postError) {
++	tmp, err := os.CreateTemp("", "s2-post-*.tmp")
++	if err != nil {
++		return nil, 0, &postError{"InternalError", err.Error(), http.StatusInternalServerError}
++	}
++	n, err := io.Copy(tmp, io.LimitReader(part, cap+1))
++	if err != nil {
++		_ = tmp.Close()
++		_ = os.Remove(tmp.Name())
++		if isRequestBodyTooLarge(err) {
++			return nil, 0, &postError{"EntityTooLarge", "Your proposed upload exceeds the maximum allowed size", http.StatusBadRequest}
++		}
++		return nil, 0, &postError{"IncompleteBody", "The file upload ended before its multipart boundary: " + err.Error(), http.StatusBadRequest}
++	}
++	if n > cap {
++		_ = tmp.Close()
++		_ = os.Remove(tmp.Name())
++		return nil, 0, &postError{"EntityTooLarge", "Your proposed upload exceeds the maximum allowed size", http.StatusBadRequest}
++	}
++	return tmp, n, nil
++}
++
++// writePostSuccess answers the upload per its success_action_* fields: a
++// redirect (303) wins over success_action_status; 201 returns the
++// PostResponse document; 200 and the default 204 return an empty body.
++func writePostSuccess(w http.ResponseWriter, r *http.Request, fields map[string]string, bucket, key, filename, etag string) {
++	if redirect := fields["success_action_redirect"]; redirect != "" {
++		loc := strings.ReplaceAll(redirect, filenameVar, filename)
++		u, err := url.Parse(loc)
++		if err != nil {
++			writeError(w, r, "InvalidArgument", err.Error(), http.StatusBadRequest)
++			return
++		}
++		q := u.Query()
++		q.Set("bucket", bucket)
++		q.Set("key", key)
++		if etag != "" {
++			q.Set("etag", etag)
++		}
++		u.RawQuery = q.Encode()
++		w.Header().Set("Location", u.String())
++		w.WriteHeader(http.StatusSeeOther)
++		return
++	}
++
++	if etag != "" {
++		w.Header().Set("ETag", etag)
++	}
++	switch fields["success_action_status"] {
++	case "201":
++		writeXML(w, http.StatusCreated, PostResponse{
++			Location: postObjectLocation(r, bucket, key),
++			Bucket:   bucket,
++			Key:      key,
++			ETag:     etag,
++		})
++	case "200":
++		w.WriteHeader(http.StatusOK)
++	default:
++		w.WriteHeader(http.StatusNoContent)
++	}
++}
++
++// postObjectLocation builds the object's externally visible URL from the
++// request, honoring X-Forwarded-Proto behind a TLS-terminating proxy.
++func postObjectLocation(r *http.Request, bucket, key string) string {
++	scheme := "http"
++	if r.TLS != nil {
++		scheme = "https"
++	}
++	if xfp := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]); xfp != "" {
++		scheme = xfp
++	}
++	segments := strings.Split(key, "/")
++	for i, seg := range segments {
++		segments[i] = url.PathEscape(seg)
++	}
++	return (&url.URL{Scheme: scheme, Host: r.Host, Path: "/" + bucket + "/" + strings.Join(segments, "/")}).String()
++}
+diff --git a/server/handlers/s3api/postobject_test.go b/server/handlers/s3api/postobject_test.go
+new file mode 100644
+index 0000000..3f8ed97
+--- /dev/null
++++ b/server/handlers/s3api/postobject_test.go
+@@ -0,0 +1,1177 @@
++package s3api
++
++import (
++	"bytes"
++	"context"
++	"crypto/hmac"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/hex"
++	"encoding/json"
++	"encoding/xml"
++	"fmt"
++	"io"
++	"mime/multipart"
++	"net/http"
++	"net/http/httptest"
++	"net/textproto"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/mojatter/s2"
++	"github.com/mojatter/s2/server"
++	"github.com/stretchr/testify/require"
++)
++
++const (
++	postTestBucket = "post-bucket"
++	postTestAK     = "postkey"
++	postTestSK     = "postsecret"
++)
++
++// --- test infrastructure ---------------------------------------------------
++
++// newPostServer builds an authenticated osfs server with one bucket and a
++// live HTTP listener. mutate may tweak the config before NewServer.
++func newPostServer(t *testing.T, mutate func(cfg *server.Config)) (*server.Server, *httptest.Server) {
++	t.Helper()
++	cfg := server.DefaultConfig()
++	cfg.Root = t.TempDir()
++	cfg.User = postTestAK
++	cfg.Password = postTestSK
++	if mutate != nil {
++		mutate(cfg)
++	}
++	srv, err := server.NewServer(context.Background(), cfg)
++	require.NoError(t, err)
++	require.NoError(t, srv.Buckets.Create(context.Background(), postTestBucket))
++	ts := httptest.NewServer(srv.S3Handler())
++	// Preserve 303 redirects from success_action_redirect for assertions.
++	ts.Client().CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
++	t.Cleanup(ts.Close)
++	return srv, ts
++}
++
++// postSigningFields computes the five SigV4 form fields the way an
++// application server hands them to the browser: sign the exact base64
++// policy with the credential-scope signing key.
++func postSigningFields(t *testing.T, accessKey, secretKey, policyB64, amzDate string) map[string]string {
++	t.Helper()
++	date := amzDate[:8]
++	h := func(key []byte, data string) []byte {
++		m := hmac.New(sha256.New, key)
++		m.Write([]byte(data))
++		return m.Sum(nil)
++	}
++	kDate := h([]byte("AWS4"+secretKey), date)
++	kRegion := h(kDate, s2Region)
++	kService := h(kRegion, "s3")
++	signingKey := h(kService, "aws4_request")
++	sig := hex.EncodeToString(h(signingKey, policyB64))
++	return map[string]string{
++		"x-amz-algorithm": "AWS4-HMAC-SHA256",
++		"x-amz-credential": fmt.Sprintf("%s/%s/%s/s3/aws4_request", accessKey, date, s2Region),
++		"x-amz-date":       amzDate,
++		"policy":           policyB64,
++		"x-amz-signature":  sig,
++	}
++}
++
++// postFormBuilder assembles a multipart/form-data POST body.
++type postFormBuilder struct {
++	buf bytes.Buffer
++	mw  *multipart.Writer
++}
++
++func newPostFormBuilder() *postFormBuilder {
++	b := &postFormBuilder{}
++	b.mw = multipart.NewWriter(&b.buf)
++	return b
++}
++
++func (b *postFormBuilder) field(name, value string) {
++	if err := b.mw.WriteField(name, value); err != nil {
++		panic(err)
++	}
++}
++
++// lastWrittenField duplicates the most recent field by writing it again,
++// without a duplicate map key (multipart allows it; the handler must not).
++func (b *postFormBuilder) fieldRaw(name, value string) {
++	if err := b.mw.WriteField(name, value); err != nil {
++		panic(err)
++	}
++}
++
++func (b *postFormBuilder) sign(t *testing.T, policyB64, amzDate, ak, sk string) {
++	t.Helper()
++	for name, value := range postSigningFields(t, ak, sk, policyB64, amzDate) {
++		b.field(name, value)
++	}
++}
++
++// signWith writes the supplied signing fields verbatim (for malformed cases).
++func (b *postFormBuilder) signWith(fields map[string]string) {
++	for name, value := range fields {
++		b.field(name, value)
++	}
++}
++
++func (b *postFormBuilder) file(filename, contentType string, content []byte) {
++	h := make(textproto.MIMEHeader)
++	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, fileFieldName, filename))
++	if contentType != "" {
++		h.Set("Content-Type", contentType)
++	}
++	w, err := b.mw.CreatePart(h)
++	if err != nil {
++		panic(err)
++	}
++	if _, err := w.Write(content); err != nil {
++		panic(err)
++	}
++}
++
++// fieldAfterFile writes another field after the file; the handler must
++// reject it because the file part has to be the form's last field.
++func (b *postFormBuilder) fieldAfterFile(name, value string) {
++	b.fieldRaw(name, value)
++}
++
++func (b *postFormBuilder) finish() ([]byte, string) {
++	if err := b.mw.Close(); err != nil {
++		panic(err)
++	}
++	return b.buf.Bytes(), b.mw.FormDataContentType()
++}
++
++// postPolicy builds and base64-encodes a policy document.
++func postPolicy(t *testing.T, expiration time.Time, conditions []any) string {
++	t.Helper()
++	doc := map[string]any{
++		"expiration": expiration.Format(time.RFC3339),
++		"conditions": conditions,
++	}
++	data, err := json.Marshal(doc)
++	require.NoError(t, err)
++	return base64.StdEncoding.EncodeToString(data)
++}
++
++// postDo sends the form and returns the finished response.
++func postDo(t *testing.T, ts *httptest.Server, target, contentType string, body []byte) *http.Response {
++	t.Helper()
++	req, err := http.NewRequest(http.MethodPost, ts.URL+target, bytes.NewReader(body))
++	require.NoError(t, err)
++	req.Header.Set("Content-Type", contentType)
++	resp, err := ts.Client().Do(req)
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = resp.Body.Close() })
++	return resp
++}
++
++func readResp(t *testing.T, resp *http.Response) string {
++	t.Helper()
++	data, err := io.ReadAll(resp.Body)
++	require.NoError(t, err)
++	return string(data)
++}
++
++func s3ErrorBody(t *testing.T, resp *http.Response) (code, message string) {
++	var doc struct {
++		Code    string `xml:"Code"`
++		Message string `xml:"Message"`
++	}
++	require.NoError(t, xml.Unmarshal([]byte(readResp(t, resp)), &doc))
++	return doc.Code, doc.Message
++}
++
++// getObjectViaAPI GETs an object with a header SigV4 signature and returns
++// its status, body, Content-Type and full headers.
++func getObjectViaAPI(t *testing.T, ts *httptest.Server, bucket, key string) (status int, body, contentType string, headers http.Header) {
++	t.Helper()
++	segments := strings.Split(key, "/")
++	for i, seg := range segments {
++		segments[i] = url.PathEscape(seg)
++	}
++	u := ts.URL + "/" + bucket + "/" + strings.Join(segments, "/")
++	req, err := http.NewRequest(http.MethodGet, u, nil)
++	require.NoError(t, err)
++	signS3Get(t, req, postTestAK, postTestSK)
++	resp, err := ts.Client().Do(req)
++	require.NoError(t, err)
++	defer func() { _ = resp.Body.Close() }()
++	data, err := io.ReadAll(resp.Body)
++	require.NoError(t, err)
++	return resp.StatusCode, string(data), resp.Header.Get("Content-Type"), resp.Header
++}
++
++// signS3Get adds a minimal header SigV4 signature (signed host header) to a
++// GET request.
++func signS3Get(t *testing.T, req *http.Request, accessKey, secretKey string) {
++	t.Helper()
++	now := time.Now().UTC()
++	amzDate := now.Format("20060102T150405Z")
++	date := now.Format("20060102")
++	scope := fmt.Sprintf("%s/%s/s3/aws4_request", date, s2Region)
++	// r.URL.Path is the decoded path; the server's canonicalizer re-encodes
++	// each segment itself.
++	segments := strings.Split(req.URL.Path, "/")
++	for i, seg := range segments {
++		segments[i] = awsURIEncodeForTest(seg)
++	}
++	canonPath := strings.Join(segments, "/")
++	canonReq := "GET\n" + canonPath + "\n\n" +
++		"host:" + req.URL.Host + "\n\n" +
++		"host\n" + emptySHA256
++	h := func(key []byte, data string) []byte {
++		m := hmac.New(sha256.New, key)
++		m.Write([]byte(data))
++		return m.Sum(nil)
++	}
++	canonHash := sha256.Sum256([]byte(canonReq))
++	stringToSign := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + hex.EncodeToString(canonHash[:])
++	kDate := h([]byte("AWS4"+secretKey), date)
++	kRegion := h(kDate, s2Region)
++	kService := h(kRegion, "s3")
++	signingKey := h(kService, "aws4_request")
++	sig := hex.EncodeToString(h(signingKey, stringToSign))
++	req.Header.Set("X-Amz-Date", amzDate)
++	req.Header.Set("Authorization", fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=host, Signature=%s", accessKey, scope, sig))
++}
++
++// awsURIEncodeForTest mirrors the server's SigV4 path encoding for the test
++// signer.
++func awsURIEncodeForTest(s string) string {
++	var b strings.Builder
++	for i := 0; i < len(s); i++ {
++		c := s[i]
++		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
++			c == '-' || c == '_' || c == '.' || c == '~' {
++			b.WriteByte(c)
++		} else {
++			fmt.Fprintf(&b, "%%%02X", c)
++		}
++	}
++	return b.String()
++}
++
++// emptySHA256 is the hex SHA-256 of the empty string (an unsigned GET body).
++const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
++
++// --- happy paths ------------------------------------------------------------
++
++func TestPostObjectSuccess(t *testing.T) {
++	srv, ts := newPostServer(t, nil)
++	now := time.Now().UTC()
++	content := []byte("hello post world")
++
++	t.Run("default 204 stores body, type and metadata", func(t *testing.T) {
++		key := "default/object.txt"
++		conds := []any{
++			map[string]string{"bucket": postTestBucket},
++			[]string{"eq", "$key", key},
++			[]string{"eq", "$Content-Type", "text/plain"},
++			[]string{"eq", "$x-amz-meta-author", "alice"},
++			[]any{"content-length-range", 1, 1024},
++		}
++		b := newPostFormBuilder()
++		b.field("key", key)
++		b.field("Content-Type", "text/plain")
++		b.field("x-amz-meta-author", "alice")
++		b.sign(t, postPolicy(t, now.Add(time.Hour), conds), now.Format("20060102T150405Z"), postTestAK, postTestSK)
++		b.file("object.txt", "text/plain", content)
++		body, ct := b.finish()
++
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusNoContent, resp.StatusCode, readResp(t, resp))
++		require.NotEmpty(t, resp.Header.Get("ETag"))
++
++		status, got, gotCT, gotHeaders := getObjectViaAPI(t, ts, postTestBucket, key)
++		require.Equal(t, http.StatusOK, status)
++		require.Equal(t, string(content), got)
++		require.Equal(t, "text/plain", gotCT)
++		require.Equal(t, "alice", gotHeaders.Get("X-Amz-Meta-Author"))
++	})
++
++	t.Run("success_action_status 201 returns PostResponse", func(t *testing.T) {
++		key := "created/photo.png"
++		conds := []any{
++			map[string]string{"bucket": postTestBucket},
++			[]string{"starts-with", "$key", "created/"},
++			[]string{"starts-with", "$Content-Type", "image/"},
++			[]any{"content-length-range", 1, 1024},
++		}
++		b := newPostFormBuilder()
++		b.field("key", key)
++		b.field("Content-Type", "image/png")
++		b.field("success_action_status", "201")
++		b.sign(t, postPolicy(t, now.Add(time.Hour), conds), now.Format("20060102T150405Z"), postTestAK, postTestSK)
++		b.file("photo.png", "image/png", content)
++		body, ct := b.finish()
++
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusCreated, resp.StatusCode)
++		var pr PostResponse
++		require.NoError(t, xml.Unmarshal([]byte(readResp(t, resp)), &pr))
++		require.Equal(t, postTestBucket, pr.Bucket)
++		require.Equal(t, key, pr.Key)
++		require.NotEmpty(t, pr.ETag)
++		require.Equal(t, ts.URL+"/"+postTestBucket+"/created/photo.png", pr.Location)
++	})
++
++	t.Run("success_action_status 200 and 204", func(t *testing.T) {
++		for _, status := range []string{"200", "204"} {
++			key := "status/" + status + ".bin"
++			conds := []any{
++				map[string]string{"bucket": postTestBucket},
++				[]string{"eq", "$key", key},
++				[]any{"content-length-range", 1, 1024},
++			}
++			b := newPostFormBuilder()
++			b.field("key", key)
++			b.field("success_action_status", status)
++			b.sign(t, postPolicy(t, now.Add(time.Hour), conds), now.Format("20060102T150405Z"), postTestAK, postTestSK)
++			b.file("f.bin", "application/octet-stream", content)
++			body, ct := b.finish()
++
++			resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++			require.Equal(t, map[string]int{"200": http.StatusOK, "204": http.StatusNoContent}[status], resp.StatusCode)
++			require.Empty(t, readResp(t, resp))
++		}
++	})
++
++	t.Run("success_action_redirect 303 with ${filename} substitution", func(t *testing.T) {
++		key := "dl/${filename}"
++		redirect := "https://example.com/done?name=${filename}&x=1"
++		conds := []any{
++			map[string]string{"bucket": postTestBucket},
++			[]string{"starts-with", "$key", "dl/"},
++			[]any{"content-length-range", 1, 1024},
++		}
++		b := newPostFormBuilder()
++		b.field("key", key)
++		b.field("success_action_redirect", redirect)
++		b.sign(t, postPolicy(t, now.Add(time.Hour), conds), now.Format("20060102T150405Z"), postTestAK, postTestSK)
++		b.file("report 1.pdf", "application/pdf", content)
++		body, ct := b.finish()
++
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusSeeOther, resp.StatusCode)
++		loc, err := url.Parse(resp.Header.Get("Location"))
++		require.NoError(t, err)
++		require.Equal(t, "https", loc.Scheme)
++		require.Equal(t, "example.com", loc.Host)
++		require.Equal(t, "report 1.pdf", loc.Query().Get("name"))
++		require.Equal(t, "1", loc.Query().Get("x"))
++		require.Equal(t, postTestBucket, loc.Query().Get("bucket"))
++		require.Equal(t, "dl/report 1.pdf", loc.Query().Get("key"))
++		require.True(t, strings.HasPrefix(loc.Query().Get("etag"), `"`))
++
++		status, got, _, _ := getObjectViaAPI(t, ts, postTestBucket, "dl/report 1.pdf")
++		require.Equal(t, http.StatusOK, status)
++		require.Equal(t, string(content), got)
++	})
++
++	t.Run("${filename} expansion and trailing-slash bucket URL", func(t *testing.T) {
++		conds := []any{
++			map[string]string{"bucket": postTestBucket},
++			[]string{"starts-with", "$key", "up/"},
++			[]any{"content-length-range", 1, 1024},
++		}
++		b := newPostFormBuilder()
++		b.field("key", "up/${filename}")
++		b.sign(t, postPolicy(t, now.Add(time.Hour), conds), now.Format("20060102T150405Z"), postTestAK, postTestSK)
++		b.file("a b.png", "image/png", content)
++		body, ct := b.finish()
++
++		resp := postDo(t, ts, "/"+postTestBucket+"/", ct, body)
++		require.Equal(t, http.StatusNoContent, resp.StatusCode, readResp(t, resp))
++		status, got, _, _ := getObjectViaAPI(t, ts, postTestBucket, "up/a b.png")
++		require.Equal(t, http.StatusOK, status)
++		require.Equal(t, string(content), got)
++	})
++
++	t.Run("no Content-Type field is left unstored", func(t *testing.T) {
++		key := "noct/file.bin"
++		conds := []any{
++			map[string]string{"bucket": postTestBucket},
++			[]string{"eq", "$key", key},
++			[]any{"content-length-range", 1, 1024},
++		}
++		b := newPostFormBuilder()
++		b.field("key", key)
++		b.sign(t, postPolicy(t, now.Add(time.Hour), conds), now.Format("20060102T150405Z"), postTestAK, postTestSK)
++		b.file("file.bin", "application/octet-stream", content)
++		body, ct := b.finish()
++
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusNoContent, resp.StatusCode, readResp(t, resp))
++
++		// Nothing is stored as Content-Type; readers resolve it. Verify the
++		// sidecar rather than the HTTP header, whose resolution varies with
++		// the host's MIME database.
++		strg, err := srv.Buckets.Get(context.Background(), postTestBucket)
++		require.NoError(t, err)
++		obj, err := strg.Get(context.Background(), key)
++		require.NoError(t, err)
++		require.Empty(t, obj.ContentType())
++		_, _, gotCT, _ := getObjectViaAPI(t, ts, postTestBucket, key)
++		require.Equal(t, server.ResolveContentType(obj, key), gotCT)
++	})
++
++	t.Run("file size counts the file, not the whole multipart body", func(t *testing.T) {
++		key := "exact/sized.bin"
++		fileContent := bytes.Repeat([]byte("z"), 321)
++		conds := []any{
++			map[string]string{"bucket": postTestBucket},
++			[]string{"eq", "$key", key},
++			[]any{"content-length-range", json.Number("321"), json.Number("321")},
++		}
++		b := newPostFormBuilder()
++		b.field("key", key)
++		b.sign(t, postPolicy(t, now.Add(time.Hour), conds), now.Format("20060102T150405Z"), postTestAK, postTestSK)
++		b.file("sized.bin", "application/octet-stream", fileContent)
++		body, ct := b.finish()
++		require.Greater(t, len(body), len(fileContent)) // framing/fields add bytes
++
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusNoContent, resp.StatusCode, readResp(t, resp))
++	})
++}
++
++// --- signature and identity -------------------------------------------------
++
++func TestPostObjectSignature(t *testing.T) {
++	_, ts := newPostServer(t, nil)
++	now := time.Now().UTC()
++	amzDate := now.Format("20060102T150405Z")
++	content := []byte("data")
++	key := "sig/k"
++	conds := []any{
++		map[string]string{"bucket": postTestBucket},
++		[]string{"eq", "$key", key},
++		[]any{"content-length-range", 1, 1024},
++	}
++
++	build := func(t *testing.T, mutateFields func(map[string]string), expiration time.Time) ([]byte, string) {
++		pb := postPolicy(t, expiration, conds)
++		fields := postSigningFields(t, postTestAK, postTestSK, pb, amzDate)
++		if mutateFields != nil {
++			mutateFields(fields)
++		}
++		b := newPostFormBuilder()
++		b.field("key", key)
++		b.signWith(fields)
++		b.file("k", "application/octet-stream", content)
++		return b.finish()
++	}
++
++	// wrong secret
++	t.Run("wrong secret", func(t *testing.T) {
++		pb := postPolicy(t, now.Add(time.Hour), conds)
++		fields := postSigningFields(t, postTestAK, "wrong-secret", pb, amzDate)
++		b := newPostFormBuilder()
++		b.field("key", key)
++		b.signWith(fields)
++		b.file("k", "application/octet-stream", content)
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusForbidden, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "SignatureDoesNotMatch", code)
++	})
++
++	// tampered policy after signing
++	t.Run("tampered policy", func(t *testing.T) {
++		body, ct := build(t, func(f map[string]string) {
++			f["policy"] = base64.StdEncoding.EncodeToString([]byte(`{"expiration":"` + now.Add(time.Hour).Format(time.RFC3339) + `","conditions":[{"bucket":"other"}]}`))
++		}, now.Add(time.Hour))
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusForbidden, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "SignatureDoesNotMatch", code)
++	})
++
++	t.Run("unknown access key", func(t *testing.T) {
++		pb := postPolicy(t, now.Add(time.Hour), conds)
++		fields := postSigningFields(t, "ghost", postTestSK, pb, amzDate)
++		b := newPostFormBuilder()
++		b.field("key", key)
++		b.signWith(fields)
++		b.file("k", "application/octet-stream", content)
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusForbidden, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "SignatureDoesNotMatch", code)
++	})
++
++	t.Run("credential date differs from x-amz-date", func(t *testing.T) {
++		pb := postPolicy(t, now.Add(time.Hour), conds)
++		fields := postSigningFields(t, postTestAK, postTestSK, pb, amzDate)
++		fields["x-amz-credential"] = fmt.Sprintf("%s/%s/%s/s3/aws4_request", postTestAK, now.AddDate(0, 0, -1).Format("20060102"), s2Region)
++		b := newPostFormBuilder()
++		b.field("key", key)
++		b.signWith(fields)
++		b.file("k", "application/octet-stream", content)
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusForbidden, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "SignatureDoesNotMatch", code)
++	})
++
++	t.Run("malformed x-amz-date", func(t *testing.T) {
++		pb := postPolicy(t, now.Add(time.Hour), conds)
++		fields := postSigningFields(t, postTestAK, postTestSK, pb, amzDate)
++		fields["x-amz-date"] = "yesterday"
++		b := newPostFormBuilder()
++		b.field("key", key)
++		b.signWith(fields)
++		b.file("k", "application/octet-stream", content)
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusForbidden, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "SignatureDoesNotMatch", code)
++	})
++
++	t.Run("expired policy", func(t *testing.T) {
++		body, ct := build(t, nil, now.Add(-time.Minute))
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusForbidden, resp.StatusCode)
++		code, msg := s3ErrorBody(t, resp)
++		require.Equal(t, "AccessDenied", code)
++		require.Contains(t, msg, "Policy expired")
++	})
++
++	t.Run("missing policy", func(t *testing.T) {
++		b := newPostFormBuilder()
++		b.field("key", key)
++		b.signWith(map[string]string{
++			"x-amz-algorithm":  "AWS4-HMAC-SHA256",
++			"x-amz-credential": fmt.Sprintf("%s/%s/%s/s3/aws4_request", postTestAK, amzDate[:8], s2Region),
++			"x-amz-date":       amzDate,
++			"x-amz-signature":  strings.Repeat("0", 64),
++		})
++		b.file("k", "application/octet-stream", content)
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusForbidden, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "AccessDenied", code)
++	})
++
++	t.Run("malformed base64 policy", func(t *testing.T) {
++		b := newPostFormBuilder()
++		b.field("key", key)
++		b.field("policy", "%%%not-base64")
++		b.signWith(map[string]string{
++			"x-amz-algorithm":  "AWS4-HMAC-SHA256",
++			"x-amz-credential": fmt.Sprintf("%s/%s/%s/s3/aws4_request", postTestAK, amzDate[:8], s2Region),
++			"x-amz-date":       amzDate,
++			"x-amz-signature":  strings.Repeat("0", 64),
++		})
++		b.file("k", "application/octet-stream", content)
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "InvalidArgument", code)
++	})
++
++	t.Run("not multipart/form-data keeps SigV4 behavior", func(t *testing.T) {
++		req, err := http.NewRequest(http.MethodPost, ts.URL+"/"+postTestBucket, strings.NewReader("{}"))
++		require.NoError(t, err)
++		req.Header.Set("Content-Type", "application/json")
++		resp, err := ts.Client().Do(req)
++		require.NoError(t, err)
++		defer func() { _ = resp.Body.Close() }()
++		require.Equal(t, http.StatusForbidden, resp.StatusCode) // missing Authorization header
++	})
++}
++
++// --- policy conditions ------------------------------------------------------
++
++func TestPostObjectPolicyConditions(t *testing.T) {
++	_, ts := newPostServer(t, nil)
++	now := time.Now().UTC().Add(time.Hour)
++	amzDate := time.Now().UTC().Format("20060102T150405Z")
++	content := []byte("condition-body")
++
++	type formField struct{ name, value string }
++
++	build := func(t *testing.T, conds []any, fields []formField, keyField, filename string) ([]byte, string) {
++		pb := postPolicy(t, now, conds)
++		sf := postSigningFields(t, postTestAK, postTestSK, pb, amzDate)
++		b := newPostFormBuilder()
++		b.field("key", keyField)
++		for _, f := range fields {
++			b.field(f.name, f.value)
++		}
++		b.signWith(sf)
++		b.file(filename, "application/octet-stream", content)
++		return b.finish()
++	}
++
++	baseConds := func(extra ...any) []any {
++		return append([]any{
++			map[string]string{"bucket": postTestBucket},
++			[]string{"eq", "$key", "k"},
++			[]any{"content-length-range", 1, 1024},
++		}, extra...)
++	}
++
++	t.Run("bucket mismatch denied", func(t *testing.T) {
++		conds := []any{
++			map[string]string{"bucket": "some-other-bucket"},
++			[]string{"eq", "$key", "k"},
++			[]any{"content-length-range", 1, 1024},
++		}
++		body, ct := build(t, conds, nil, "k", "f")
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusForbidden, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "AccessDenied", code)
++	})
++
++	t.Run("missing bucket condition invalid", func(t *testing.T) {
++		conds := []any{
++			[]string{"eq", "$key", "k"},
++			[]any{"content-length-range", 1, 1024},
++		}
++		body, ct := build(t, conds, nil, "k", "f")
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "InvalidArgument", code)
++	})
++
++	t.Run("exact key mismatch denied", func(t *testing.T) {
++		body, ct := build(t, baseConds(), nil, "different", "f")
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusForbidden, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "AccessDenied", code)
++	})
++
++	t.Run("content type exact and starts-with", func(t *testing.T) {
++		conds := baseConds([]string{"eq", "$Content-Type", "image/png"})
++		body, ct := build(t, conds, []formField{{"Content-Type", "image/png"}}, "k", "f")
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusNoContent, resp.StatusCode, readResp(t, resp))
++
++		conds = baseConds([]string{"starts-with", "$Content-Type", "image/"})
++		body, ct = build(t, conds, []formField{{"Content-Type", "text/plain"}}, "k", "f")
++		resp = postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusForbidden, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "AccessDenied", code)
++	})
++
++	t.Run("condition for missing field denied", func(t *testing.T) {
++		conds := baseConds([]string{"eq", "$x-amz-meta-team", "infra"})
++		body, ct := build(t, conds, nil, "k", "f")
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusForbidden, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "AccessDenied", code)
++	})
++
++	t.Run("metadata exact match stored", func(t *testing.T) {
++		conds := baseConds(
++			[]string{"eq", "$x-amz-meta-team", "infra"},
++			[]string{"starts-with", "$x-amz-meta-tag", "release-"},
++		)
++		body, ct := build(t, conds, []formField{
++			{"x-amz-meta-team", "infra"},
++			{"x-amz-meta-tag", "release-2026"},
++		}, "k", "f")
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusNoContent, resp.StatusCode, readResp(t, resp))
++		_, _, _, h := getObjectViaAPI(t, ts, postTestBucket, "k")
++		require.Equal(t, "infra", h.Get("X-Amz-Meta-Team"))
++		require.Equal(t, "release-2026", h.Get("X-Amz-Meta-Tag"))
++	})
++
++	t.Run("unconstrained extra field denied", func(t *testing.T) {
++		body, ct := build(t, baseConds(), []formField{{"x-amz-meta-team", "rogue"}}, "k", "f")
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusForbidden, resp.StatusCode)
++		code, msg := s3ErrorBody(t, resp)
++		require.Equal(t, "AccessDenied", code)
++		require.Contains(t, msg, "x-amz-meta-team")
++	})
++
++	t.Run("unsupported condition field invalid", func(t *testing.T) {
++		conds := baseConds([]string{"eq", "$acl", "private"})
++		body, ct := build(t, conds, []formField{{"acl", "private"}}, "k", "f")
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "InvalidArgument", code)
++	})
++
++	t.Run("unsupported operator invalid", func(t *testing.T) {
++		conds := baseConds([]string{"less-than", "$x-amz-meta-n", "5"})
++		body, ct := build(t, conds, []formField{{"x-amz-meta-n", "1"}}, "k", "f")
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "InvalidArgument", code)
++	})
++
++	t.Run("contradictory content-length-range denied", func(t *testing.T) {
++		conds := baseConds(
++			[]any{"content-length-range", json.Number("100"), json.Number("200")},
++			[]any{"content-length-range", json.Number("300"), json.Number("400")},
++		)
++		body, ct := build(t, conds, nil, "k", "f")
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusForbidden, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "AccessDenied", code)
++	})
++
++	t.Run("malformed range invalid", func(t *testing.T) {
++		conds := []any{
++			map[string]string{"bucket": postTestBucket},
++			[]string{"eq", "$key", "k"},
++			[]any{"content-length-range", json.Number("500"), json.Number("100")},
++		}
++		body, ct := build(t, conds, nil, "k", "f")
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "InvalidArgument", code)
++	})
++}
++
++// --- size limits ------------------------------------------------------------
++
++func TestPostObjectSizeLimits(t *testing.T) {
++	t.Run("policy max enforced", func(t *testing.T) {
++		_, ts := newPostServer(t, nil)
++		amzDate := time.Now().UTC().Format("20060102T150405Z")
++		exp := time.Now().UTC().Add(time.Hour)
++		content := bytes.Repeat([]byte("a"), 50)
++		key := "lim/max"
++		conds := []any{
++			map[string]string{"bucket": postTestBucket},
++			[]string{"eq", "$key", key},
++			[]any{"content-length-range", json.Number("1"), json.Number("10")},
++		}
++		b := newPostFormBuilder()
++		b.field("key", key)
++		b.sign(t, postPolicy(t, exp, conds), amzDate, postTestAK, postTestSK)
++		b.file("f", "application/octet-stream", content)
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "EntityTooLarge", code)
++	})
++
++	t.Run("policy min enforced", func(t *testing.T) {
++		_, ts := newPostServer(t, nil)
++		amzDate := time.Now().UTC().Format("20060102T150405Z")
++		exp := time.Now().UTC().Add(time.Hour)
++		content := []byte("tiny")
++		key := "lim/min"
++		conds := []any{
++			map[string]string{"bucket": postTestBucket},
++			[]string{"eq", "$key", key},
++			[]any{"content-length-range", json.Number("100"), json.Number("1000")},
++		}
++		b := newPostFormBuilder()
++		b.field("key", key)
++		b.sign(t, postPolicy(t, exp, conds), amzDate, postTestAK, postTestSK)
++		b.file("f", "application/octet-stream", content)
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "EntityTooSmall", code)
++	})
++
++	t.Run("server upload limit enforced even without policy range", func(t *testing.T) {
++		_, ts := newPostServer(t, func(cfg *server.Config) { cfg.MaxUploadSize = 32 })
++		amzDate := time.Now().UTC().Format("20060102T150405Z")
++		exp := time.Now().UTC().Add(time.Hour)
++		content := bytes.Repeat([]byte("a"), 64)
++		key := "lim/server"
++		conds := []any{
++			map[string]string{"bucket": postTestBucket},
++			[]string{"eq", "$key", key},
++		}
++		b := newPostFormBuilder()
++		b.field("key", key)
++		b.sign(t, postPolicy(t, exp, conds), amzDate, postTestAK, postTestSK)
++		b.file("f", "application/octet-stream", content)
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "EntityTooLarge", code)
++	})
++}
++
++// --- malformed forms --------------------------------------------------------
++
++func TestPostObjectMalformedForm(t *testing.T) {
++	_, ts := newPostServer(t, nil)
++	amzDate := time.Now().UTC().Format("20060102T150405Z")
++	exp := time.Now().UTC().Add(time.Hour)
++	conds := []any{
++		map[string]string{"bucket": postTestBucket},
++		[]string{"starts-with", "$key", "f/"},
++		[]any{"content-length-range", 1, 1024},
++	}
++	pb := postPolicy(t, exp, conds)
++	signed := postSigningFields(t, postTestAK, postTestSK, pb, amzDate)
++
++	t.Run("missing key", func(t *testing.T) {
++		b := newPostFormBuilder()
++		b.signWith(signed)
++		b.file("f.bin", "application/octet-stream", []byte("x"))
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "InvalidArgument", code)
++	})
++
++	t.Run("missing file", func(t *testing.T) {
++		b := newPostFormBuilder()
++		b.field("key", "f/x")
++		b.signWith(signed)
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "InvalidArgument", code)
++	})
++
++	t.Run("duplicate field rejected", func(t *testing.T) {
++		b := newPostFormBuilder()
++		b.field("key", "f/x")
++		b.fieldRaw("key", "f/y")
++		b.signWith(signed)
++		b.file("x", "application/octet-stream", []byte("x"))
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
++		code, msg := s3ErrorBody(t, resp)
++		require.Equal(t, "InvalidArgument", code)
++		require.Contains(t, msg, "Duplicate")
++	})
++
++	t.Run("field after file rejected", func(t *testing.T) {
++		b := newPostFormBuilder()
++		b.field("key", "f/x")
++		b.signWith(signed)
++		b.file("x", "application/octet-stream", []byte("x"))
++		b.fieldAfterFile("x-amz-meta-late", "1")
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "InvalidArgument", code)
++	})
++
++	t.Run("invalid success_action_status", func(t *testing.T) {
++		b := newPostFormBuilder()
++		b.field("key", "f/x")
++		b.field("success_action_status", "418")
++		b.signWith(signed)
++		b.file("x", "application/octet-stream", []byte("x"))
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "InvalidArgument", code)
++	})
++
++	t.Run("invalid redirect URL", func(t *testing.T) {
++		b := newPostFormBuilder()
++		b.field("key", "f/x")
++		b.field("success_action_redirect", "/relative/path")
++		b.signWith(signed)
++		b.file("x", "application/octet-stream", []byte("x"))
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "InvalidArgument", code)
++	})
++
++	t.Run("invalid key rejected before policy evaluation", func(t *testing.T) {
++		b := newPostFormBuilder()
++		b.field("key", "../escape.txt")
++		b.signWith(signed)
++		b.file("x", "text/plain", []byte("x"))
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "InvalidArgument", code)
++	})
++
++	t.Run("truncated stream is incomplete", func(t *testing.T) {
++		fileContent := bytes.Repeat([]byte("x"), 4000)
++		b := newPostFormBuilder()
++		b.field("key", "f/x")
++		b.signWith(signed)
++		b.file("x", "application/octet-stream", fileContent)
++		full, ct := b.finish()
++		// Cut deterministically inside the file part, well past every text
++		// field but before the file's closing boundary.
++		marker := bytes.Repeat([]byte("x"), 200)
++		fileStart := bytes.Index(full, marker)
++		require.Greater(t, fileStart, 0)
++		cut := fileStart + 100
++		req, err := http.NewRequest(http.MethodPost, ts.URL+"/"+postTestBucket, bytes.NewReader(full[:cut]))
++		require.NoError(t, err)
++		req.Header.Set("Content-Type", ct)
++		resp, err := ts.Client().Do(req)
++		require.NoError(t, err)
++		defer func() { _ = resp.Body.Close() }()
++		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "IncompleteBody", code)
++	})
++
++	t.Run("no such bucket", func(t *testing.T) {
++		ghostConds := []any{
++			map[string]string{"bucket": "ghost-bucket"},
++			[]string{"eq", "$key", "f/x"},
++			[]any{"content-length-range", json.Number("1"), json.Number("1024")},
++		}
++		ghostSigned := postSigningFields(t, postTestAK, postTestSK, postPolicy(t, time.Now().UTC().Add(time.Hour), ghostConds), amzDate)
++		b := newPostFormBuilder()
++		b.field("key", "f/x")
++		b.signWith(ghostSigned)
++		b.file("x", "application/octet-stream", []byte("x"))
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/ghost-bucket", ct, body)
++		require.Equal(t, http.StatusNotFound, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "NoSuchBucket", code)
++	})
++}
++
++// --- failure atomicity: old object and temp cleanup -------------------------
++
++func TestPostObjectFailureKeepsOldObject(t *testing.T) {
++	srv, ts := newPostServer(t, nil)
++	ctx := context.Background()
++	strg, err := srv.Buckets.Get(ctx, postTestBucket)
++	require.NoError(t, err)
++
++	const key = "atomic/key.txt"
++	original := []byte("ORIGINAL-BODY")
++	require.NoError(t, strg.Put(ctx, s2.NewObjectBytes(key, original,
++		s2.WithContentType("text/original"), s2.WithMetadata(s2.Metadata{"author": "original"}))))
++
++	amzDate := time.Now().UTC().Format("20060102T150405Z")
++	exp := time.Now().UTC().Add(time.Hour)
++
++	submit := func(t *testing.T, conds []any, content []byte, sign func(map[string]string), mutateBody func([]byte, string) ([]byte, string)) {
++		pb := postPolicy(t, exp, conds)
++		fields := postSigningFields(t, postTestAK, postTestSK, pb, amzDate)
++		if sign != nil {
++			sign(fields)
++		}
++		b := newPostFormBuilder()
++		b.field("key", key)
++		b.signWith(fields)
++		b.file("key.txt", "text/new", content)
++		body, ct := b.finish()
++		if mutateBody != nil {
++			body, ct = mutateBody(body, ct)
++		}
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.NotEqual(t, http.StatusNoContent, resp.StatusCode)
++		require.NotEqual(t, http.StatusCreated, resp.StatusCode)
++	}
++
++	rangeConds := []any{
++		map[string]string{"bucket": postTestBucket},
++		[]string{"eq", "$key", key},
++		[]any{"content-length-range", json.Number("1"), json.Number("10")},
++	}
++
++	t.Run("oversized upload", func(t *testing.T) {
++		submit(t, rangeConds, bytes.Repeat([]byte("n"), 50), nil, nil)
++	})
++	t.Run("undersized upload", func(t *testing.T) {
++		minConds := []any{
++			map[string]string{"bucket": postTestBucket},
++			[]string{"eq", "$key", key},
++			[]any{"content-length-range", json.Number("1000"), json.Number("2000")},
++		}
++		submit(t, minConds, []byte("small"), nil, nil)
++	})
++	t.Run("bad signature", func(t *testing.T) {
++		submit(t, rangeConds, []byte("new"), func(f map[string]string) {
++			f["x-amz-signature"] = strings.Repeat("f", 64)
++		}, nil)
++	})
++	t.Run("condition mismatch", func(t *testing.T) {
++		otherConds := []any{
++			map[string]string{"bucket": postTestBucket},
++			[]string{"eq", "$key", key + "/other"},
++			[]any{"content-length-range", json.Number("1"), json.Number("10")},
++		}
++		submit(t, otherConds, []byte("new"), nil, nil)
++	})
++	t.Run("truncated stream", func(t *testing.T) {
++		wideConds := []any{
++			map[string]string{"bucket": postTestBucket},
++			[]string{"eq", "$key", key},
++			[]any{"content-length-range", json.Number("1"), json.Number("100000")},
++		}
++		submit(t, wideConds, bytes.Repeat([]byte("n"), 4000), nil, func(body []byte, ct string) ([]byte, string) {
++			marker := bytes.Repeat([]byte("n"), 200)
++			fileStart := bytes.Index(body, marker)
++			require.Greater(t, fileStart, 0)
++			return body[:fileStart+100], ct
++		})
++	})
++
++	// Every failure above must leave the original body, type and metadata.
++	obj, err := strg.Get(ctx, key)
++	require.NoError(t, err)
++	rc, err := obj.Open()
++	require.NoError(t, err)
++	defer func() { _ = rc.Close() }()
++	got, err := io.ReadAll(rc)
++	require.NoError(t, err)
++	require.Equal(t, original, got)
++	require.Equal(t, "text/original", obj.ContentType())
++	require.Equal(t, "original", obj.Metadata()["author"])
++
++	// All spool temp files are removed once the request is answered.
++	leftovers, err := filepath.Glob(filepath.Join(os.TempDir(), "s2-post-*.tmp"))
++	require.NoError(t, err)
++	require.Empty(t, leftovers)
++}
++
++// --- IAM policy on the resolved resource ------------------------------------
++
++func TestPostObjectIAMPolicy(t *testing.T) {
++	policyJSON := `{
++		"Version": "2012-10-17",
++		"Statement": [{
++			"Effect": "Allow",
++			"Action": "s3:PutObject",
++			"Resource": "arn:aws:s3:::` + postTestBucket + `/allowed/*"
++		}]
++	}`
++	var policy server.Policy
++	require.NoError(t, json.Unmarshal([]byte(policyJSON), &policy))
++
++	_, ts := newPostServer(t, func(cfg *server.Config) {
++		cfg.Users = []server.User{{
++			AccessKeyID:     "limited",
++			SecretAccessKey: "limited-secret",
++			Policy:          &policy,
++		}}
++	})
++	amzDate := time.Now().UTC().Format("20060102T150405Z")
++	exp := time.Now().UTC().Add(time.Hour)
++
++	submit := func(t *testing.T, key string) *http.Response {
++		conds := []any{
++			map[string]string{"bucket": postTestBucket},
++			[]string{"starts-with", "$key", ""},
++			[]any{"content-length-range", 1, 1024},
++		}
++		b := newPostFormBuilder()
++		b.field("key", key)
++		b.sign(t, postPolicy(t, exp, conds), amzDate, "limited", "limited-secret")
++		b.file("f", "application/octet-stream", []byte("payload"))
++		body, ct := b.finish()
++		return postDo(t, ts, "/"+postTestBucket, ct, body)
++	}
++
++	t.Run("prefix within grant", func(t *testing.T) {
++		resp := submit(t, "allowed/a.txt")
++		require.Equal(t, http.StatusNoContent, resp.StatusCode, readResp(t, resp))
++	})
++	t.Run("prefix outside grant denied", func(t *testing.T) {
++		resp := submit(t, "forbidden/b.txt")
++		require.Equal(t, http.StatusForbidden, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "AccessDenied", code)
++	})
++}
++
++// --- auth disabled -----------------------------------------------------------
++
++func TestPostObjectAuthDisabled(t *testing.T) {
++	_, ts := newPostServer(t, func(cfg *server.Config) {
++		cfg.User = ""
++		cfg.Password = ""
++	})
++
++	t.Run("unsigned form without policy accepted", func(t *testing.T) {
++		b := newPostFormBuilder()
++		b.field("key", "open/x.txt")
++		b.file("x.txt", "text/plain", []byte("open"))
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusNoContent, resp.StatusCode, readResp(t, resp))
++	})
++
++	t.Run("supplied policy still enforced", func(t *testing.T) {
++		exp := time.Now().UTC().Add(time.Hour)
++		conds := []any{
++			map[string]string{"bucket": postTestBucket},
++			[]string{"eq", "$key", "open/pinned.txt"},
++			[]string{"eq", "$Content-Type", "text/plain"},
++		}
++		b := newPostFormBuilder()
++		b.field("key", "open/different.txt")
++		b.field("Content-Type", "text/plain")
++		b.field("policy", postPolicy(t, exp, conds))
++		b.file("pinned.txt", "text/plain", []byte("x"))
++		body, ct := b.finish()
++		resp := postDo(t, ts, "/"+postTestBucket, ct, body)
++		require.Equal(t, http.StatusForbidden, resp.StatusCode)
++		code, _ := s3ErrorBody(t, resp)
++		require.Equal(t, "AccessDenied", code)
++	})
++}
++
++// --- DeleteObjects regression -----------------------------------------------
++
++func TestPostDeleteObjectsDispatchUnchanged(t *testing.T) {
++	_, ts := newPostServer(t, nil)
++	// An UNSIGNED DeleteObjects must be rejected by the header/query SigV4
++	// path, proving the presigned-POST dispatcher did not swallow ?delete.
++	body := `<Delete><Object><Key>whatever</Key></Object></Delete>`
++	req, err := http.NewRequest(http.MethodPost, ts.URL+"/"+postTestBucket+"?delete", strings.NewReader(body))
++	require.NoError(t, err)
++	req.Header.Set("Content-Type", "application/xml")
++	resp, err := ts.Client().Do(req)
++	require.NoError(t, err)
++	defer func() { _ = resp.Body.Close() }()
++	require.Equal(t, http.StatusForbidden, resp.StatusCode)
++	code, _ := s3ErrorBody(t, resp)
++	require.Equal(t, "SignatureDoesNotMatch", code)
++
++	// A non-multipart, unsigned bucket POST without ?delete also stays on
++	// the SigV4 path (and is never treated as a presigned POST).
++	req2, err := http.NewRequest(http.MethodPost, ts.URL+"/"+postTestBucket, strings.NewReader("{}"))
++	require.NoError(t, err)
++	req2.Header.Set("Content-Type", "application/json")
++	resp2, err := ts.Client().Do(req2)
++	require.NoError(t, err)
++	defer func() { _ = resp2.Body.Close() }()
++	require.Equal(t, http.StatusForbidden, resp2.StatusCode)
++}
+diff --git a/server/middleware/sigv4.go b/server/middleware/sigv4.go
+index 28bb966..1bfd74d 100644
+--- a/server/middleware/sigv4.go
++++ b/server/middleware/sigv4.go
+@@ -230,6 +230,64 @@ func verifyPresignedV4(r *http.Request, lookup func(accessKeyID string) (user *s
+ 	return user, nil
+ }
+ 
++// PostPolicyFields carries the signing fields of an AWS SigV4 browser-based
++// presigned POST form (POST /{bucket} with multipart/form-data). Policy is
++// the base64 policy exactly as submitted: the signature is computed over that
++// exact string, never its decoded form.
++type PostPolicyFields struct {
++	Algorithm  string
++	Credential string
++	Date       string // x-amz-date, "20060102T150405Z"
++	Policy     string
++	Signature  string
++}
++
++// VerifyPostPolicyV4 verifies the signing fields of a presigned POST upload.
++// It checks that Algorithm is AWS4-HMAC-SHA256, Credential parses as
++// "<access-key>/<date>/<region>/<service>/aws4_request" and resolves via
++// lookup, x-amz-date is well-formed and shares the credential's date, and
++// that Signature is the hex HMAC-SHA256 of the base64 policy under the
++// SigV4 signing key.
++//
++// It deliberately does NOT decode the policy or enforce its expiration and
++// conditions: the POST handler does that with the actual submitted form
++// values. Expiration is policy-governed (a presigned POST may stay valid far
++// longer than the ±15 minute header-SigV4 skew), so no skew check applies.
++func VerifyPostPolicyV4(lookup func(accessKeyID string) (user *server.User, ok bool), f PostPolicyFields) (*server.User, error) {
++	if f.Algorithm != "AWS4-HMAC-SHA256" {
++		return nil, fmt.Errorf("unsupported x-amz-algorithm: %q", f.Algorithm)
++	}
++	credParts := strings.SplitN(f.Credential, "/", 5)
++	if len(credParts) != 5 || credParts[4] != "aws4_request" {
++		return nil, fmt.Errorf("malformed Credential")
++	}
++	reqAccessKey, date, region, service := credParts[0], credParts[1], credParts[2], credParts[3]
++
++	user, ok := lookup(reqAccessKey)
++	if !ok {
++		return nil, fmt.Errorf("invalid access key")
++	}
++
++	if _, err := time.Parse("20060102T150405Z", f.Date); err != nil {
++		return nil, fmt.Errorf("invalid x-amz-date: %w", err)
++	}
++	if date != f.Date[:8] {
++		return nil, fmt.Errorf("x-amz-date %q does not match credential date %q", f.Date, date)
++	}
++	// A malformed credential date would derive a key without ever being
++	// rejected as a timestamp; a parse here pins it to a real UTC day.
++	if _, err := time.Parse("20060102", date); err != nil {
++		return nil, fmt.Errorf("invalid credential date %q", date)
++	}
++
++	signingKey := buildSigningKey(user.SecretAccessKey, date, region, service)
++	expected := hex.EncodeToString(hmacSHA256(signingKey, []byte(f.Policy)))
++	if subtle.ConstantTimeCompare([]byte(expected), []byte(f.Signature)) != 1 {
++		return nil, fmt.Errorf("signature mismatch")
++	}
++	return user, nil
++}
++
+ // stripQueryParam removes all occurrences of name from a raw (unparsed) query string,
+ // preserving the order and exact encoding of the remaining parameters.
+ func stripQueryParam(rawQuery, name string) string {
+diff --git a/server/middleware/sigv4_test.go b/server/middleware/sigv4_test.go
+index 8aa5b9a..e4049a2 100644
+--- a/server/middleware/sigv4_test.go
++++ b/server/middleware/sigv4_test.go
+@@ -758,3 +758,68 @@ func TestParseAuthHeader(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// postPolicyFields builds a validly-signed set of presigned POST form
++// fields; cases mutate individual fields before verification.
++func postPolicyFields(now time.Time, accessKey, secretKey string) PostPolicyFields {
++	date := now.Format("20060102")
++	scope := date + "/us-east-1/s3/aws4_request"
++	policyB64 := "eyJleHBpcmF0aW9uIjoiMjk5OS0wMS0wMVQwMDowMDowMC4wMDBaIn0="
++	sig := hex.EncodeToString(hmacSHA256(buildSigningKey(secretKey, date, "us-east-1", "s3"), []byte(policyB64)))
++	return PostPolicyFields{
++		Algorithm:  "AWS4-HMAC-SHA256",
++		Credential: accessKey + "/" + scope,
++		Date:       now.Format("20060102T150405Z"),
++		Policy:     policyB64,
++		Signature:  sig,
++	}
++}
++
++func TestVerifyPostPolicyV4(t *testing.T) {
++	const accessKey, secretKey = "postAK", "postSK"
++	users := map[string]*server.User{accessKey: {AccessKeyID: accessKey, SecretAccessKey: secretKey}}
++	lookup := func(id string) (*server.User, bool) {
++		u, ok := users[id]
++		return u, ok
++	}
++	now := time.Now().UTC()
++
++	t.Run("valid", func(t *testing.T) {
++		user, err := VerifyPostPolicyV4(lookup, postPolicyFields(now, accessKey, secretKey))
++		assert.NoError(t, err)
++		assert.Equal(t, accessKey, user.AccessKeyID)
++	})
++
++	cases := []struct {
++		name   string
++		mutate func(*PostPolicyFields)
++	}{
++		{"wrong algorithm", func(f *PostPolicyFields) { f.Algorithm = "AWS4-HMAC-SHA1" }},
++		{"malformed credential", func(f *PostPolicyFields) { f.Credential = "garbage" }},
++		{"wrong terminal scope", func(f *PostPolicyFields) { f.Credential = accessKey + "/20200101/us-east-1/s3/not_aws4" }},
++		{"unknown access key", func(f *PostPolicyFields) { f.Credential = strings.Replace(f.Credential, accessKey, "ghost", 1) }},
++		{"bad date", func(f *PostPolicyFields) { f.Date = "not-a-date" }},
++		{"credential date mismatch", func(f *PostPolicyFields) {
++			f.Credential = accessKey + "/" + now.AddDate(0, 0, -1).Format("20060102") + "/us-east-1/s3/aws4_request"
++		}},
++		{"bad signature", func(f *PostPolicyFields) { f.Signature = strings.Repeat("0", 64) }},
++		{"signature over different policy", func(f *PostPolicyFields) { f.Policy = f.Policy + "x" }},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			f := postPolicyFields(now, accessKey, secretKey)
++			tc.mutate(&f)
++			_, err := VerifyPostPolicyV4(lookup, f)
++			assert.Error(t, err)
++		})
++	}
++
++	t.Run("signature uses the exact base64 policy string", func(t *testing.T) {
++		// A syntactically different policy with the same bytes re-encoded
++		// must fail: the signature is on the submitted string.
++		f := postPolicyFields(now, accessKey, secretKey)
++		f.Policy = strings.Replace(f.Policy, "In0=", "In0", 1)
++		_, err := VerifyPostPolicyV4(lookup, f)
++		assert.Error(t, err)
++	})
++}

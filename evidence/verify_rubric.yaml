@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: bucket 级 multipart/form-data POST 被识别为 S3 POST Object，而 POST ?delete 仍走原有 DeleteObjects；表单从现有 Users 或 legacy credential 解析 principal，不会被 header/query SigV4 的缺失认证提前拒绝。
+  - id: 2
+    type: f2p
+    text: x-amz-algorithm、credential scope、x-amz-date、base64 policy、signature 和 policy expiration 按 SigV4 POST 规则共同验证；未知用户、错误 scope/secret、篡改 policy、过期或畸形字段在任何对象写入前得到稳定 S3 认证错误。
+  - id: 3
+    type: f2p
+    text: policy 的 bucket/key、Content-Type 与 x-amz-meta 精确或 starts-with 条件和 content-length-range 分别约束实际表单与文件；${filename} 只替换上传文件名，缺失、重复、未受约束或冲突的安全字段不能绕过条件。
+  - id: 4
+    type: f2p
+    text: 表单验证后仍以最终 bucket/key 对 matched principal 执行 s3:PutObject 授权；允许前缀可写，跨桶、越过 key 前缀、显式 Deny 和匿名写均拒绝且不产生对象。
+  - id: 5
+    type: f2p
+    text: 上传上限按 file part 的实际字节而非 multipart 包装计算；断流、超限、multipart 解析或临时文件失败及后端写失败都清理中间资源、保留同名旧对象和原 attributes，故障解除且 policy 有效时可重试。
+  - id: 6
+    type: f2p
+    text: 成功上传保存 policy 允许的 metadata 与 Content-Type；默认成功、success_action_status=201 和合法 success_action_redirect 分别返回兼容状态、PostResponse 或重定向，其 Location、Bucket、Key 和 ETag 与随后 HEAD/GET 观察完全一致。
+  - id: 7
+    type: p2p
+    text: 原有 DeleteObjects、Authorization header 与 query presign、presigned PUT、普通和 multipart 上传、Web Console 表单上传、max upload 默认值及仓库既有测试保持固定版本兼容。

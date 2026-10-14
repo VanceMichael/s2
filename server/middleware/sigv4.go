@@ -230,6 +230,64 @@ func verifyPresignedV4(r *http.Request, lookup func(accessKeyID string) (user *s
 	return user, nil
 }
 
+// PostPolicyFields carries the signing fields of an AWS SigV4 browser-based
+// presigned POST form (POST /{bucket} with multipart/form-data). Policy is
+// the base64 policy exactly as submitted: the signature is computed over that
+// exact string, never its decoded form.
+type PostPolicyFields struct {
+	Algorithm  string
+	Credential string
+	Date       string // x-amz-date, "20060102T150405Z"
+	Policy     string
+	Signature  string
+}
+
+// VerifyPostPolicyV4 verifies the signing fields of a presigned POST upload.
+// It checks that Algorithm is AWS4-HMAC-SHA256, Credential parses as
+// "<access-key>/<date>/<region>/<service>/aws4_request" and resolves via
+// lookup, x-amz-date is well-formed and shares the credential's date, and
+// that Signature is the hex HMAC-SHA256 of the base64 policy under the
+// SigV4 signing key.
+//
+// It deliberately does NOT decode the policy or enforce its expiration and
+// conditions: the POST handler does that with the actual submitted form
+// values. Expiration is policy-governed (a presigned POST may stay valid far
+// longer than the ±15 minute header-SigV4 skew), so no skew check applies.
+func VerifyPostPolicyV4(lookup func(accessKeyID string) (user *server.User, ok bool), f PostPolicyFields) (*server.User, error) {
+	if f.Algorithm != "AWS4-HMAC-SHA256" {
+		return nil, fmt.Errorf("unsupported x-amz-algorithm: %q", f.Algorithm)
+	}
+	credParts := strings.SplitN(f.Credential, "/", 5)
+	if len(credParts) != 5 || credParts[4] != "aws4_request" {
+		return nil, fmt.Errorf("malformed Credential")
+	}
+	reqAccessKey, date, region, service := credParts[0], credParts[1], credParts[2], credParts[3]
+
+	user, ok := lookup(reqAccessKey)
+	if !ok {
+		return nil, fmt.Errorf("invalid access key")
+	}
+
+	if _, err := time.Parse("20060102T150405Z", f.Date); err != nil {
+		return nil, fmt.Errorf("invalid x-amz-date: %w", err)
+	}
+	if date != f.Date[:8] {
+		return nil, fmt.Errorf("x-amz-date %q does not match credential date %q", f.Date, date)
+	}
+	// A malformed credential date would derive a key without ever being
+	// rejected as a timestamp; a parse here pins it to a real UTC day.
+	if _, err := time.Parse("20060102", date); err != nil {
+		return nil, fmt.Errorf("invalid credential date %q", date)
+	}
+
+	signingKey := buildSigningKey(user.SecretAccessKey, date, region, service)
+	expected := hex.EncodeToString(hmacSHA256(signingKey, []byte(f.Policy)))
+	if subtle.ConstantTimeCompare([]byte(expected), []byte(f.Signature)) != 1 {
+		return nil, fmt.Errorf("signature mismatch")
+	}
+	return user, nil
+}
+
 // stripQueryParam removes all occurrences of name from a raw (unparsed) query string,
 // preserving the order and exact encoding of the remaining parameters.
 func stripQueryParam(rawQuery, name string) string {

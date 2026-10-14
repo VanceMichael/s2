@@ -63,6 +63,17 @@ type CopyObjectResult struct {
 	ETag         string    `xml:"ETag,omitempty"`
 }
 
+// PostResponse represents the XML response for a presigned POST upload that
+// set success_action_status=201. Location/Bucket/Key/ETag all describe the
+// object that was actually written.
+type PostResponse struct {
+	XMLName  xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ PostResponse"`
+	Location string   `xml:"Location"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	ETag     string   `xml:"ETag,omitempty"`
+}
+
 // LocationConstraint represents the XML response for GetBucketLocation.
 type LocationConstraint struct {
 	XMLName  xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ LocationConstraint"`

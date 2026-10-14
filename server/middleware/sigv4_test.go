@@ -758,3 +758,68 @@ func TestParseAuthHeader(t *testing.T) {
 		})
 	}
 }
+
+// postPolicyFields builds a validly-signed set of presigned POST form
+// fields; cases mutate individual fields before verification.
+func postPolicyFields(now time.Time, accessKey, secretKey string) PostPolicyFields {
+	date := now.Format("20060102")
+	scope := date + "/us-east-1/s3/aws4_request"
+	policyB64 := "eyJleHBpcmF0aW9uIjoiMjk5OS0wMS0wMVQwMDowMDowMC4wMDBaIn0="
+	sig := hex.EncodeToString(hmacSHA256(buildSigningKey(secretKey, date, "us-east-1", "s3"), []byte(policyB64)))
+	return PostPolicyFields{
+		Algorithm:  "AWS4-HMAC-SHA256",
+		Credential: accessKey + "/" + scope,
+		Date:       now.Format("20060102T150405Z"),
+		Policy:     policyB64,
+		Signature:  sig,
+	}
+}
+
+func TestVerifyPostPolicyV4(t *testing.T) {
+	const accessKey, secretKey = "postAK", "postSK"
+	users := map[string]*server.User{accessKey: {AccessKeyID: accessKey, SecretAccessKey: secretKey}}
+	lookup := func(id string) (*server.User, bool) {
+		u, ok := users[id]
+		return u, ok
+	}
+	now := time.Now().UTC()
+
+	t.Run("valid", func(t *testing.T) {
+		user, err := VerifyPostPolicyV4(lookup, postPolicyFields(now, accessKey, secretKey))
+		assert.NoError(t, err)
+		assert.Equal(t, accessKey, user.AccessKeyID)
+	})
+
+	cases := []struct {
+		name   string
+		mutate func(*PostPolicyFields)
+	}{
+		{"wrong algorithm", func(f *PostPolicyFields) { f.Algorithm = "AWS4-HMAC-SHA1" }},
+		{"malformed credential", func(f *PostPolicyFields) { f.Credential = "garbage" }},
+		{"wrong terminal scope", func(f *PostPolicyFields) { f.Credential = accessKey + "/20200101/us-east-1/s3/not_aws4" }},
+		{"unknown access key", func(f *PostPolicyFields) { f.Credential = strings.Replace(f.Credential, accessKey, "ghost", 1) }},
+		{"bad date", func(f *PostPolicyFields) { f.Date = "not-a-date" }},
+		{"credential date mismatch", func(f *PostPolicyFields) {
+			f.Credential = accessKey + "/" + now.AddDate(0, 0, -1).Format("20060102") + "/us-east-1/s3/aws4_request"
+		}},
+		{"bad signature", func(f *PostPolicyFields) { f.Signature = strings.Repeat("0", 64) }},
+		{"signature over different policy", func(f *PostPolicyFields) { f.Policy = f.Policy + "x" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := postPolicyFields(now, accessKey, secretKey)
+			tc.mutate(&f)
+			_, err := VerifyPostPolicyV4(lookup, f)
+			assert.Error(t, err)
+		})
+	}
+
+	t.Run("signature uses the exact base64 policy string", func(t *testing.T) {
+		// A syntactically different policy with the same bytes re-encoded
+		// must fail: the signature is on the submitted string.
+		f := postPolicyFields(now, accessKey, secretKey)
+		f.Policy = strings.Replace(f.Policy, "In0=", "In0", 1)
+		_, err := VerifyPostPolicyV4(lookup, f)
+		assert.Error(t, err)
+	})
+}

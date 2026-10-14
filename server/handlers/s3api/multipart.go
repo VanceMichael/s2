@@ -526,15 +526,28 @@ func (p *partsReader) Close() error {
 	return nil
 }
 
-func handleObjectPOST(s *server.Server, w http.ResponseWriter, r *http.Request) {
-	// A trailing-slash bucket request (e.g. "POST /my-bucket/?delete")
-	// routes to this pattern with an empty key. Delegate to the
-	// bucket-level POST handler so DeleteObjects continues to work.
+// objectPOSTWithSigV4 is the unchanged SigV4-wrapped object POST handler
+// (CreateMultipartUpload/CompleteMultipartUpload/ListParts routing);
+// hoisted so the entry dispatcher does not rebuild the wrapper per request.
+var objectPOSTWithSigV4 = middleware.SigV4(handleObjectPOST)
+
+func handleObjectPOSTEntry(s *server.Server, w http.ResponseWriter, r *http.Request) {
+	// A trailing-slash bucket request (e.g. "POST /my-bucket/?delete", or a
+	// browser presigned POST to "POST /my-bucket/") routes here with an empty
+	// key. The bucket entry chooses between form-based POST authentication
+	// and the header/query SigV4 path itself, so it must run outside this
+	// route's SigV4 wrapper or an unsigned browser form would be rejected as
+	// anonymous before its signature is read.
 	if r.PathValue("key") == "" {
-		handleBucketPOST(s, w, r)
+		handleBucketPOSTEntry(s, w, r)
 		return
 	}
+	objectPOSTWithSigV4(s, w, r)
+}
 
+func handleObjectPOST(s *server.Server, w http.ResponseWriter, r *http.Request) {
+	// Empty-key (trailing-slash) bucket POSTs are intercepted by
+	// handleObjectPOSTEntry before this SigV4-wrapped handler runs.
 	q := r.URL.Query()
 	if _, ok := q["uploads"]; ok {
 		handleCreateMultipartUpload(s, w, r)
@@ -548,5 +561,5 @@ func handleObjectPOST(s *server.Server, w http.ResponseWriter, r *http.Request) 
 }
 
 func init() {
-	server.RegisterS3HandleFunc("POST /{bucket}/{key...}", middleware.SigV4(handleObjectPOST))
+	server.RegisterS3HandleFunc("POST /{bucket}/{key...}", handleObjectPOSTEntry)
 }

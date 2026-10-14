@@ -753,7 +753,7 @@ func handleBucketGET(s *server.Server, w http.ResponseWriter, r *http.Request) {
 
 func init() {
 	server.RegisterS3HandleFunc("GET /{bucket}", middleware.SigV4(handleBucketGET))
-	server.RegisterS3HandleFunc("POST /{bucket}", middleware.SigV4(handleBucketPOST))
+	server.RegisterS3HandleFunc("POST /{bucket}", handleBucketPOSTEntry)
 	server.RegisterS3HandleFunc("GET /{bucket}/{key...}", middleware.SigV4(handleGetObject))
 	server.RegisterS3HandleFunc("HEAD /{bucket}/{key...}", middleware.SigV4(handleGetObject))
 	server.RegisterS3HandleFunc("PUT /{bucket}/{key...}", middleware.SigV4(handlePutObject))
