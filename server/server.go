@@ -122,24 +122,9 @@ func Run(args []string) error {
 		return nil
 	}
 
-	cfg := DefaultConfig()
-	if f.configFile != "" {
-		if err := cfg.LoadFile(f.configFile); err != nil {
-			return err
-		}
-	}
-	if err := cfg.LoadEnv(); err != nil {
+	cfg, err := buildConfig(f)
+	if err != nil {
 		return err
-	}
-	// Flags have the highest precedence: default < file < env < flag.
-	if f.listen != nil {
-		cfg.Listen = *f.listen
-	}
-	if f.root != nil {
-		cfg.Root = *f.root
-	}
-	if f.buckets != nil {
-		cfg.Buckets = splitBucketList(*f.buckets)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -159,13 +144,60 @@ func Run(args []string) error {
 		slog.Info("Created initial bucket", "name", name)
 	}
 
-	slog.Info("Listening", "addr", cfg.Listen)
-	return srv.Start(ctx)
+	// SIGHUP reloads are only available when a config file was supplied;
+	// newReloadSignals returns nil otherwise, leaving the behavior of
+	// file-less deployments unchanged.
+	hupCh := newReloadSignals(f.configFile)
+	if hupCh != nil {
+		defer signal.Stop(hupCh)
+	}
+
+	slog.Info("Listening", "addr", cfg.Listen, "generation", srv.ConfigGeneration())
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Start(ctx)
+	}()
+
+	for {
+		select {
+		case err := <-errCh:
+			// A listener died; Start already shut the others down.
+			return err
+		case <-ctx.Done():
+			// SIGINT/SIGTERM: wait only for graceful shutdown. A SIGHUP
+			// that races with shutdown is ignored rather than starting a
+			// pointless last reload; reloads never touch the shutdown
+			// path, so a reload already in progress cannot delay this.
+			return <-errCh
+		case <-hupCh:
+			if ctx.Err() != nil {
+				return <-errCh
+			}
+			// Coalesce a SIGHUP already queued behind this one. This pass
+			// re-reads the file anyway; any signal that arrives while the
+			// reload runs remains buffered and is handled on the next
+			// iteration. The buffer size of 1 plus the runtime's
+			// non-blocking delivery bounds bursts: no per-signal
+			// goroutine is ever started.
+			select {
+			case <-hupCh:
+			default:
+			}
+			srv.reloadAndLog(f)
+		}
+	}
 }
 
 // Server is a web server that provides a Web Console and S3-compatible API for S2.
 type Server struct {
+	// Config is the configuration the server was started with. Runtime
+	// fields are immutable by construction (a reload rejects candidates
+	// that drift), so listeners, storage, and templates can read it
+	// directly. Request-time authentication must use CurrentConfig to
+	// observe the generation published by the latest SIGHUP reload.
 	Config    *Config
+	configs   *configStore
 	Template  *template.Template
 	Buckets   *Buckets
 	Multipart *MultipartStore
@@ -191,6 +223,7 @@ func NewServer(ctx context.Context, cfg *Config) (*Server, error) {
 	}
 	return &Server{
 		Config:    cfg,
+		configs:   newConfigStore(cfg),
 		Template:  tmpl,
 		Buckets:   buckets,
 		Multipart: multipart,

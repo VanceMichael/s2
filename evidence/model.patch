@@ -1,0 +1,1244 @@
+diff --git a/docs/users-policy.md b/docs/users-policy.md
+index feb36d7..e5e3155 100644
+--- a/docs/users-policy.md
++++ b/docs/users-policy.md
+@@ -43,7 +43,7 @@ Each entry:
+ 
+ A principal with **no `policy` field** (or the legacy `user`/`password` pair) has full access — this matches S2's pre-multi-user behavior, so existing single-credential configs keep working unchanged. A principal with a `policy` that has **no matching statement** for a given action is denied by default (deny-by-default once a policy is attached).
+ 
+-**Policy changes require a server restart.** Config (including `users` and every `policy`) is loaded once at startup; there is no hot-reload or `SIGHUP` handling. Editing the config file or environment variables while the server is running has no effect until you restart it.
++**Credential and policy changes can be applied with `SIGHUP`.** Send `SIGHUP` to the running process (`kill -HUP <pid>`) after editing the config file: the server rebuilds a candidate configuration with the same precedence as startup (defaults &lt; config file &lt; environment variables &lt; explicit command-line flags), validates it as a whole, and atomically publishes it as a new configuration generation. Only the legacy `user`/`password` pair and the `users` list (each entry's credentials and `policy`) may change at runtime; a candidate that also changes the listen addresses, storage type/root, initial buckets, health path, upload limits, or any other runtime/resource field is rejected in full, and the previous generation keeps serving. An unreadable or missing file, malformed JSON, an invalid policy, or a duplicate `access_key_id` likewise leaves the previous generation untouched (the outcome is logged distinctly); fix the source and send `SIGHUP` again to recover. Each request authenticates against one complete snapshot taken at request start, so in-flight requests finish against the old generation while new requests use the new one. Deployments started without a config file ignore `SIGHUP`.
+ 
+ ## Policy grammar
+ 
+diff --git a/server/middleware/basicauth.go b/server/middleware/basicauth.go
+index 8084b57..9b062e5 100644
+--- a/server/middleware/basicauth.go
++++ b/server/middleware/basicauth.go
+@@ -25,12 +25,17 @@ import (
+ // requires a real credential.
+ func BasicAuth(next server.HandlerFunc) server.HandlerFunc {
+ 	return func(srv *server.Server, w http.ResponseWriter, r *http.Request) {
+-		if !srv.Config.AuthEnabled() {
++		// Snapshot one configuration generation per request, matching
++		// SigV4: the credential comparison and the policy decision must
++		// come from the same User of the same generation, never a mix of
++		// a pre- and post-SIGHUP configuration.
++		cfg := srv.CurrentConfig()
++		if !cfg.AuthEnabled() {
+ 			next(srv, w, r)
+ 			return
+ 		}
+ 		user, pass, ok := r.BasicAuth()
+-		u := srv.Config.LookupUser(user)
++		u := cfg.LookupUser(user)
+ 		if !ok || u == nil || u.AccessKeyID == server.AnonymousAccessKeyID || subtle.ConstantTimeCompare([]byte(pass), []byte(u.SecretAccessKey)) != 1 {
+ 			w.Header().Set("WWW-Authenticate", `Basic realm="s2"`)
+ 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+diff --git a/server/middleware/sigv4.go b/server/middleware/sigv4.go
+index 28bb966..a380b52 100644
+--- a/server/middleware/sigv4.go
++++ b/server/middleware/sigv4.go
+@@ -39,13 +39,20 @@ const (
+ // then checked exactly like any other matched User's.
+ func SigV4(next server.HandlerFunc) server.HandlerFunc {
+ 	return func(srv *server.Server, w http.ResponseWriter, r *http.Request) {
+-		if !srv.Config.AuthEnabled() {
++		// Take one immutable configuration snapshot for the whole request.
++		// The Authorization-header, presigned-query, anonymous fallback,
++		// and policy checks below must all resolve principals, secrets,
++		// and policies from this same generation: a SIGHUP publish that
++		// lands while this request is in flight cannot make the signature
++		// check use an old secret and the policy check a new principal.
++		cfg := srv.CurrentConfig()
++		if !cfg.AuthEnabled() {
+ 			next(srv, w, r)
+ 			return
+ 		}
+ 
+ 		lookup := func(accessKeyID string) (*server.User, bool) {
+-			u := srv.Config.LookupUser(accessKeyID)
++			u := cfg.LookupUser(accessKeyID)
+ 			return u, u != nil
+ 		}
+ 
+diff --git a/server/reload.go b/server/reload.go
+new file mode 100644
+index 0000000..7d27540
+--- /dev/null
++++ b/server/reload.go
+@@ -0,0 +1,219 @@
++package server
++
++import (
++	"fmt"
++	"log/slog"
++	"os"
++	"os/signal"
++	"reflect"
++	"slices"
++	"sync/atomic"
++	"syscall"
++)
++
++// InitialGeneration is the generation number of the configuration the
++// server was started with. Every successful SIGHUP reload publishes a new,
++// monotonically increasing generation.
++const InitialGeneration = 1
++
++// configGeneration pairs one fully validated, immutable Config with its
++// generation number. Once published, neither the pointer nor the Config it
++// points to is ever mutated: a reload always builds a fresh Config and
++// publishes a new configGeneration atomically. Requests that captured the
++// old pointer keep using the old generation for their whole lifetime, so a
++// secret/principal/policy from one generation can never be mixed with
++// another's inside a single request.
++type configGeneration struct {
++	config     *Config
++	generation uint64
++}
++
++// configStore holds the active config generation. Swap is the only
++// mutation; reads are lock-free.
++type configStore struct {
++	active atomic.Pointer[configGeneration]
++}
++
++func newConfigStore(cfg *Config) *configStore {
++	st := &configStore{}
++	st.active.Store(&configGeneration{config: cfg, generation: InitialGeneration})
++	return st
++}
++
++func (st *configStore) current() *Config {
++	return st.active.Load().config
++}
++
++func (st *configStore) generation() uint64 {
++	return st.active.Load().generation
++}
++
++// publish installs cfg as the next generation and returns its number. The
++// CAS loop makes generation numbers strictly increasing even under
++// concurrent callers (SIGHUP reloads themselves are serialized by Run).
++func (st *configStore) publish(cfg *Config) uint64 {
++	for {
++		old := st.active.Load()
++		next := &configGeneration{config: cfg, generation: old.generation + 1}
++		if st.active.CompareAndSwap(old, next) {
++			return next.generation
++		}
++	}
++}
++
++// CurrentConfig returns the configuration of the active generation. The
++// returned pointer is shared by concurrent requests and must never be
++// mutated; callers that need altered values must copy it first.
++func (s *Server) CurrentConfig() *Config {
++	if s.configs != nil {
++		return s.configs.current()
++	}
++	// Tolerate Servers constructed by hand (e.g. middleware unit tests
++	// that fill only the Config field).
++	return s.Config
++}
++
++// ConfigGeneration returns the generation number of the active
++// configuration, or InitialGeneration for hand-constructed Servers.
++func (s *Server) ConfigGeneration() uint64 {
++	if s.configs != nil {
++		return s.configs.generation()
++	}
++	return InitialGeneration
++}
++
++// buildConfig constructs a candidate configuration using the same sources
++// and precedence as startup: defaults < config file < environment
++// variables < explicit command-line flags. It performs no validation;
++// callers run Config.Validate (and, for reloads, checkImmutableFields) on
++// the result.
++func buildConfig(f *Flags) (*Config, error) {
++	cfg := DefaultConfig()
++	if f.configFile != "" {
++		if err := cfg.LoadFile(f.configFile); err != nil {
++			return nil, err
++		}
++	}
++	if err := cfg.LoadEnv(); err != nil {
++		return nil, err
++	}
++	// Flags have the highest precedence: default < file < env < flag.
++	if f.listen != nil {
++		cfg.Listen = *f.listen
++	}
++	if f.root != nil {
++		cfg.Root = *f.root
++	}
++	if f.buckets != nil {
++		cfg.Buckets = splitBucketList(*f.buckets)
++	}
++	return cfg, nil
++}
++
++// ReloadConfig rebuilds the configuration from the startup sources with the
++// same precedence, validates the whole candidate, and -- when only mutable
++// fields (legacy User/Password and Users, each with its credentials and
++// policy) changed -- publishes it atomically as the next generation.
++//
++// On any failure (missing/unreadable file, invalid JSON, invalid policy,
++// duplicate access key, or a drifted runtime/resource field) the active
++// generation is left untouched and the error is returned; the server keeps
++// serving with the previous configuration.
++//
++// Listeners, storage, and other runtime resources are never rebuilt here,
++// so in-flight requests are never interrupted.
++func (s *Server) ReloadConfig(f *Flags) (uint64, error) {
++	cand, err := buildConfig(f)
++	if err != nil {
++		return 0, fmt.Errorf("reload: load candidate configuration: %w", err)
++	}
++	if err := cand.Validate(); err != nil {
++		return 0, fmt.Errorf("reload: invalid candidate configuration: %w", err)
++	}
++	if err := checkImmutableFields(s.CurrentConfig(), cand); err != nil {
++		return 0, err
++	}
++	return s.configs.publish(cand), nil
++}
++
++// reloadAndLog runs one reload, recording outcomes that are distinguishable
++// in the log stream: successful publishes (Info, new generation) versus
++// rejected candidates (Error, kept generation plus the cause).
++func (s *Server) reloadAndLog(f *Flags) {
++	gen, err := s.ReloadConfig(f)
++	if err != nil {
++		slog.Error("Configuration reload failed; continuing with previous configuration",
++			"error", err, "generation", s.ConfigGeneration())
++		return
++	}
++	cfg := s.CurrentConfig()
++	slog.Info("Configuration reloaded",
++		"generation", gen, "auth_enabled", cfg.AuthEnabled(), "users", len(cfg.Users))
++}
++
++// checkImmutableFields rejects candidates whose runtime/resource fields
++// drifted from the running generation. Only Config.User, Config.Password,
++// and Config.Users (credentials and policies) may change at runtime;
++// everything else requires a restart. The comparison runs after
++// Config.Validate, so a candidate reaching here is already a coherent
++// configuration -- the rejection is specifically about drift.
++func checkImmutableFields(old, cand *Config) error {
++	if cand.Listen != old.Listen {
++		return immutableFieldError("listen", old.Listen, cand.Listen)
++	}
++	if cand.ConsoleListen != old.ConsoleListen {
++		return immutableFieldError("console_listen", old.ConsoleListen, cand.ConsoleListen)
++	}
++	if cand.HealthPath != old.HealthPath {
++		return immutableFieldError("health_path", old.HealthPath, cand.HealthPath)
++	}
++	if cand.MaxUploadSize != old.MaxUploadSize {
++		return immutableIntFieldError("max_upload_size", old.MaxUploadSize, cand.MaxUploadSize)
++	}
++	if cand.MaxPreviewSize != old.MaxPreviewSize {
++		return immutableIntFieldError("max_preview_size", old.MaxPreviewSize, cand.MaxPreviewSize)
++	}
++	if cand.MultipartMaxAge != old.MultipartMaxAge {
++		return immutableIntFieldError("multipart_max_age", old.MultipartMaxAge, cand.MultipartMaxAge)
++	}
++	if !slices.Equal(cand.Buckets, old.Buckets) {
++		return fmt.Errorf("reload: initial buckets changed at runtime (old=%q new=%q); restart required",
++			old.Buckets, cand.Buckets)
++	}
++	// The embedded s2.Config covers storage Type and Root, SignedURL, and
++	// every per-backend block (S3/GCS/Azblob credentials and endpoints).
++	if !reflect.DeepEqual(old.Config, cand.Config) {
++		return fmt.Errorf("reload: storage configuration (type/root/backend settings) changed at runtime (old type=%q root=%q, new type=%q root=%q); restart required",
++			old.Type, old.Root, cand.Type, cand.Root)
++	}
++	return nil
++}
++
++func immutableFieldError(field, oldValue, newValue string) error {
++	return fmt.Errorf("reload: %s changed at runtime (old=%q new=%q); restart required", field, oldValue, newValue)
++}
++
++func immutableIntFieldError(field string, oldValue, newValue int64) error {
++	return fmt.Errorf("reload: %s changed at runtime (old=%d new=%d); restart required", field, oldValue, newValue)
++}
++
++// newReloadSignals starts delivering SIGHUP on a buffered channel when the
++// server was started with a configuration file. It returns nil for
++// deployments without a config file: SIGHUP then stays unregistered and
++// such a deployment keeps its original behavior.
++//
++// The channel buffer is 1. Go's signal delivery is non-blocking, so while
++// one SIGHUP is being handled a burst of further signals coalesces into at
++// most one queued wake-up (excess signals are dropped by the runtime); and
++// because every reload re-reads the file from disk, that single wake-up
++// still converges on the latest file contents. Finite signal bursts
++// therefore terminate after a bounded number of reloads with no per-signal
++// goroutines.
++func newReloadSignals(configFile string) chan os.Signal {
++	if configFile == "" {
++		return nil
++	}
++	ch := make(chan os.Signal, 1)
++	signal.Notify(ch, syscall.SIGHUP)
++	return ch
++}
+diff --git a/server/reload_test.go b/server/reload_test.go
+new file mode 100644
+index 0000000..5386654
+--- /dev/null
++++ b/server/reload_test.go
+@@ -0,0 +1,372 @@
++package server
++
++import (
++	"context"
++	"encoding/json"
++	"os"
++	"os/signal"
++	"path/filepath"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/mojatter/s2"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// configEnvVars are every environment variable consulted by LoadEnv;
++// tests clear them so a developer machine or CI cannot change precedence
++// results, and restore the original values on cleanup.
++var configEnvVars = []string{
++	EnvS2ServerConfig,
++	EnvS2ServerListen,
++	EnvS2ServerConsoleListen,
++	EnvS2ServerHealthPath,
++	EnvS2ServerType,
++	EnvS2ServerRoot,
++	EnvS2ServerMaxUploadSize,
++	EnvS2ServerMaxPreviewSize,
++	EnvS2ServerMultipartMaxAge,
++	EnvS2ServerUser,
++	EnvS2ServerPassword,
++	EnvS2ServerBuckets,
++}
++
++func clearConfigEnv(t *testing.T) {
++	t.Helper()
++	for _, key := range configEnvVars {
++		v, ok := os.LookupEnv(key)
++		os.Unsetenv(key)
++		if ok {
++			t.Cleanup(func() { os.Setenv(key, v) })
++		}
++	}
++}
++
++// writeReloadConfig marshals cfg as JSON to path.
++func writeReloadConfig(t *testing.T, path string, cfg *Config) {
++	t.Helper()
++	data, err := json.MarshalIndent(cfg, "", "  ")
++	require.NoError(t, err)
++	require.NoError(t, os.WriteFile(path, data, 0o644))
++}
++
++// reloadTestConfig builds a valid, self-contained config rooted in a temp
++// directory with the console disabled; mutable credential fields are
++// filled by the caller.
++func reloadTestConfig(root string) *Config {
++	cfg := DefaultConfig()
++	cfg.Root = root
++	cfg.Listen = "127.0.0.1:9911"
++	cfg.ConsoleListen = ""
++	return cfg
++}
++
++func TestConfigStoreInitialAndPublish(t *testing.T) {
++	first := &Config{User: "u1", Password: "p1"}
++	st := newConfigStore(first)
++
++	assert.Equal(t, uint64(InitialGeneration), st.generation())
++	assert.Same(t, first, st.current())
++
++	second := &Config{User: "u2", Password: "p2"}
++	gen := st.publish(second)
++	assert.Equal(t, uint64(2), gen)
++	assert.Same(t, second, st.current())
++
++	// The previous generation's pointer stays readable and untouched: a
++	// request already holding it finishes against u1/p1.
++	assert.Equal(t, "u1", first.User)
++	assert.Equal(t, "p1", first.Password)
++}
++
++func TestConfigStorePublishMonotonicUnderConcurrency(t *testing.T) {
++	st := newConfigStore(&Config{})
++	const n = 100
++
++	var wg sync.WaitGroup
++	wg.Add(n)
++	gens := make(chan uint64, n)
++	for i := 0; i < n; i++ {
++		go func() {
++			defer wg.Done()
++			gens <- st.publish(&Config{})
++		}()
++	}
++	wg.Wait()
++	close(gens)
++
++	seen := make(map[uint64]bool, n)
++	for g := range gens {
++		assert.False(t, seen[g], "duplicate generation %d", g)
++		seen[g] = true
++	}
++	assert.Equal(t, uint64(InitialGeneration+n), st.generation())
++}
++
++func TestBuildConfigPrecedence(t *testing.T) {
++	clearConfigEnv(t)
++	root := t.TempDir()
++	path := filepath.Join(root, "s2.json")
++
++	fileCfg := reloadTestConfig(root)
++	fileCfg.Listen = "127.0.0.1:7001"
++	fileCfg.User = "file-user"
++	fileCfg.Buckets = []string{"file-bucket"}
++	writeReloadConfig(t, path, fileCfg)
++
++	t.Setenv(EnvS2ServerListen, "127.0.0.1:7002")
++	t.Setenv(EnvS2ServerUser, "env-user")
++	t.Setenv(EnvS2ServerBuckets, "env-bucket")
++
++	flagListen := "127.0.0.1:7003"
++	flagBuckets := "flag-bucket"
++	f := &Flags{configFile: path, listen: &flagListen, buckets: &flagBuckets}
++
++	cfg, err := buildConfig(f)
++	require.NoError(t, err)
++
++	// Explicit flag beats env beats file.
++	assert.Equal(t, "127.0.0.1:7003", cfg.Listen)
++	assert.Equal(t, "env-user", cfg.User)
++	assert.Equal(t, []string{"flag-bucket"}, cfg.Buckets)
++	// Non-overridden file fields survive.
++	assert.Equal(t, root, cfg.Root)
++	assert.Equal(t, "/healthz", cfg.HealthPath)
++}
++
++func TestBuildConfigWithoutFile(t *testing.T) {
++	clearConfigEnv(t)
++	cfg, err := buildConfig(&Flags{})
++	require.NoError(t, err)
++	assert.Equal(t, DefaultConfig(), cfg)
++}
++
++func TestCheckImmutableFields(t *testing.T) {
++	readOnlyPolicy := &Policy{Version: "2012-10-17", Statement: []Statement{
++		{Effect: "Allow", Action: []string{ActionGetObject}, Resource: []string{"arn:aws:s3:::*"}},
++	}}
++
++	base := reloadTestConfig(t.TempDir())
++	base.User = "admin"
++	base.Password = "secret"
++	base.Buckets = []string{"initial"}
++	base.Users = []User{
++		{AccessKeyID: "ro", SecretAccessKey: "ro-secret", Policy: readOnlyPolicy},
++	}
++
++	mutable := map[string]func(*Config){
++		"legacy password rotated": func(c *Config) { c.Password = "rotated" },
++		"legacy user rotated":     func(c *Config) { c.User = "admin2" },
++		"users entry added":       func(c *Config) { c.Users = append(c.Users, User{AccessKeyID: "n2", SecretAccessKey: "s2"}) },
++		"users entry removed":     func(c *Config) { c.Users = nil },
++		"user secret rotated":     func(c *Config) { c.Users[0].SecretAccessKey = "new-secret" },
++		"user policy replaced": func(c *Config) {
++			c.Users[0].Policy = &Policy{Version: "2012-10-17", Statement: []Statement{
++				{Effect: "Allow", Action: []string{ActionListBucket}, Resource: []string{"arn:aws:s3:::*"}},
++			}}
++		},
++		"auth disabled by empty user": func(c *Config) { c.User, c.Password, c.Users = "", "", nil },
++	}
++	for name, mutate := range mutable {
++		t.Run("mutable/"+name, func(t *testing.T) {
++			cand := *base
++			mutate(&cand)
++			assert.NoError(t, checkImmutableFields(base, &cand))
++		})
++	}
++
++	immutable := map[string]func(*Config){
++		"listen":          func(c *Config) { c.Listen = "127.0.0.1:1" },
++		"console_listen":  func(c *Config) { c.ConsoleListen = "127.0.0.1:1" },
++		"health_path":     func(c *Config) { c.HealthPath = "/ready" },
++		"max_upload_size": func(c *Config) { c.MaxUploadSize = 1234 },
++		"max_preview":     func(c *Config) { c.MaxPreviewSize = 4321 },
++		"multipart_age":   func(c *Config) { c.MultipartMaxAge = 99 },
++		"buckets":         func(c *Config) { c.Buckets = []string{"different"} },
++		"storage type":    func(c *Config) { c.Type = s2.TypeMemFS },
++		"storage root":    func(c *Config) { c.Root = "/somewhere/else" },
++		"signed_url":      func(c *Config) { c.SignedURL = "http://example" },
++		"s3 backend":      func(c *Config) { c.S3 = &s2.S3Config{EndpointURL: "http://s3"} },
++		"gcs backend":     func(c *Config) { c.GCS = &s2.GCSConfig{CredentialsFile: "/k.json"} },
++		"azblob backend":  func(c *Config) { c.Azblob = &s2.AzblobConfig{AccountName: "acct"} },
++	}
++	for name, mutate := range immutable {
++		t.Run("immutable/"+name, func(t *testing.T) {
++			cand := *base
++			mutate(&cand)
++			err := checkImmutableFields(base, &cand)
++			require.Error(t, err)
++			assert.Contains(t, err.Error(), "changed at runtime")
++		})
++	}
++}
++
++func TestReloadConfigPublishesMutableChanges(t *testing.T) {
++	clearConfigEnv(t)
++	root := t.TempDir()
++	path := filepath.Join(root, "s2.json")
++
++	first := reloadTestConfig(root)
++	first.User, first.Password = "user1", "pass1"
++	writeReloadConfig(t, path, first)
++
++	f := &Flags{configFile: path}
++	cfg, err := buildConfig(f)
++	require.NoError(t, err)
++	srv, err := NewServer(context.Background(), cfg)
++	require.NoError(t, err)
++	assert.Equal(t, uint64(1), srv.ConfigGeneration())
++
++	// A request-like reader captures the generation before the reload.
++	oldGen := srv.CurrentConfig()
++
++	second := reloadTestConfig(root)
++	second.User, second.Password = "user2", "pass2"
++	second.Users = []User{
++		{AccessKeyID: "ro", SecretAccessKey: "ro-pass", Policy: &Policy{
++			Version: "2012-10-17",
++			Statement: []Statement{{
++				Effect: "Allow", Action: []string{ActionGetObject}, Resource: []string{"arn:aws:s3:::*"},
++			}},
++		}},
++	}
++	writeReloadConfig(t, path, second)
++
++	gen, err := srv.ReloadConfig(f)
++	require.NoError(t, err)
++	assert.Equal(t, uint64(2), gen)
++
++	current := srv.CurrentConfig()
++	assert.Equal(t, "user2", current.User)
++	assert.Equal(t, "pass2", current.Password)
++	require.Len(t, current.Users, 1)
++	assert.Equal(t, "ro", current.Users[0].AccessKeyID)
++
++	// The startup Config is untouched and immutable fields stayed equal.
++	assert.Equal(t, "user1", srv.Config.User)
++	assert.Equal(t, first.Listen, current.Listen)
++
++	// The captured old generation still resolves the old principal with
++	// the old secret: an in-flight request that took its snapshot before
++	// publish can never observe user2's principal or policy.
++	u := oldGen.LookupUser("user1")
++	require.NotNil(t, u)
++	assert.Equal(t, "pass1", u.SecretAccessKey)
++	assert.Nil(t, oldGen.LookupUser("user2"))
++	assert.Nil(t, oldGen.LookupUser("ro"))
++}
++
++func TestReloadConfigRejectsAndKeepsOldGeneration(t *testing.T) {
++	clearConfigEnv(t)
++	root := t.TempDir()
++	path := filepath.Join(root, "s2.json")
++
++	first := reloadTestConfig(root)
++	first.User, first.Password = "user1", "pass1"
++	writeReloadConfig(t, path, first)
++
++	f := &Flags{configFile: path}
++	cfg, err := buildConfig(f)
++	require.NoError(t, err)
++	srv, err := NewServer(context.Background(), cfg)
++	require.NoError(t, err)
++
++	// A valid rotation first, so later failures can be proven to roll back
++	// to this generation rather than the startup one.
++	rotated := reloadTestConfig(root)
++	rotated.User, rotated.Password = "good2", "good2-pass"
++	writeReloadConfig(t, path, rotated)
++	gen, err := srv.ReloadConfig(f)
++	require.NoError(t, err)
++	require.Equal(t, uint64(2), gen)
++
++	rejectAndKeepGen2 := func(t *testing.T, name string, write func(t *testing.T, path string)) {
++		t.Helper()
++		write(t, path)
++		_, err := srv.ReloadConfig(f)
++		require.Error(t, err, name)
++		assert.Equal(t, uint64(2), srv.ConfigGeneration(), name)
++		current := srv.CurrentConfig()
++		assert.Equal(t, "good2", current.User, name)
++		assert.Equal(t, "good2-pass", current.Password, name)
++	}
++
++	t.Run("malformed JSON", func(t *testing.T) {
++		rejectAndKeepGen2(t, "malformed JSON", func(t *testing.T, path string) {
++			require.NoError(t, os.WriteFile(path, []byte(`{ "user": "broken`), 0o644))
++		})
++	})
++
++	t.Run("missing file", func(t *testing.T) {
++		missing := filepath.Join(t.TempDir(), "missing.json")
++		_, err := srv.ReloadConfig(&Flags{configFile: missing})
++		require.Error(t, err)
++		assert.Equal(t, uint64(2), srv.ConfigGeneration())
++	})
++
++	t.Run("duplicate access key", func(t *testing.T) {
++		rejectAndKeepGen2(t, "duplicate access key", func(t *testing.T, path string) {
++			bad := reloadTestConfig(root)
++			bad.User, bad.Password = "dup", "p"
++			bad.Users = []User{
++				{AccessKeyID: "dup", SecretAccessKey: "p2"},
++			}
++			writeReloadConfig(t, path, bad)
++		})
++	})
++
++	t.Run("invalid policy", func(t *testing.T) {
++		rejectAndKeepGen2(t, "invalid policy", func(t *testing.T, path string) {
++			bad := reloadTestConfig(root)
++			bad.User, bad.Password = "good2", "good2-pass"
++			bad.Users = []User{{
++				AccessKeyID:     "ro",
++				SecretAccessKey: "ro-pass",
++				Policy: &Policy{Statement: []Statement{{
++					Effect: "Maybe", Action: []string{ActionGetObject}, Resource: []string{"arn:aws:s3:::*"},
++				}}},
++			}}
++			writeReloadConfig(t, path, bad)
++		})
++	})
++
++	t.Run("immutable field drift", func(t *testing.T) {
++		rejectAndKeepGen2(t, "immutable drift", func(t *testing.T, path string) {
++			bad := reloadTestConfig(root)
++			bad.Listen = "127.0.0.1:4242"
++			bad.User, bad.Password = "good2", "good2-pass"
++			writeReloadConfig(t, path, bad)
++		})
++	})
++
++	// Fixing the source and reloading recovers: the generation after the
++	// rejected attempts is exactly 3, proving none of them published.
++	fixed := reloadTestConfig(root)
++	fixed.User, fixed.Password = "good3", "good3-pass"
++	writeReloadConfig(t, path, fixed)
++	gen, err = srv.ReloadConfig(f)
++	require.NoError(t, err)
++	assert.Equal(t, uint64(3), gen)
++	assert.Equal(t, "good3", srv.CurrentConfig().User)
++}
++
++func TestNewReloadSignals(t *testing.T) {
++	t.Run("no config file means no SIGHUP handler", func(t *testing.T) {
++		assert.Nil(t, newReloadSignals(""))
++	})
++
++	t.Run("SIGHUP is delivered until stopped", func(t *testing.T) {
++		ch := newReloadSignals(t.Name())
++		t.Cleanup(func() { signal.Stop(ch) })
++
++		require.NoError(t, syscall.Kill(syscall.Getpid(), syscall.SIGHUP))
++		select {
++		case <-ch:
++		case <-time.After(500 * time.Millisecond):
++			t.Fatal("SIGHUP was not delivered to the reload channel")
++		}
++	})
++}
+diff --git a/server/run_reload_test.go b/server/run_reload_test.go
+new file mode 100644
+index 0000000..3822b1f
+--- /dev/null
++++ b/server/run_reload_test.go
+@@ -0,0 +1,468 @@
++package server_test
++
++import (
++	"crypto/hmac"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"net"
++	"net/http"
++	"net/url"
++	"os"
++	"os/signal"
++	"path/filepath"
++	"sort"
++	"strings"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/mojatter/s2/server"
++	"github.com/mojatter/s2/server/middleware"
++	"github.com/stretchr/testify/require"
++)
++
++// registerReloadProbesOnce installs the routes used by the reload E2E
++// suite exactly once per test binary.
++var registerReloadProbesOnce sync.Once
++
++// This suite drives a full `server.Run` binary-style lifecycle against a
++// config file and exercises credential rotation over real HTTP (SigV4
++// header, SigV4 presigned query, anonymous principal, and Console
++// BasicAuth) using process-directed SIGHUP/SIGTERM.
++
++var reloadEnvVars = []string{
++	"S2_SERVER_CONFIG", "S2_SERVER_LISTEN", "S2_SERVER_CONSOLE_LISTEN",
++	"S2_SERVER_HEALTH_PATH", "S2_SERVER_TYPE", "S2_SERVER_ROOT",
++	"S2_SERVER_MAX_UPLOAD_SIZE", "S2_SERVER_MAX_PREVIEW_SIZE",
++	"S2_SERVER_MULTIPART_MAX_AGE", "S2_SERVER_USER", "S2_SERVER_PASSWORD",
++	"S2_SERVER_BUCKETS",
++}
++
++func clearReloadEnv(t *testing.T) {
++	t.Helper()
++	for _, key := range reloadEnvVars {
++		v, ok := os.LookupEnv(key)
++		os.Unsetenv(key)
++		if ok {
++			t.Cleanup(func() { os.Setenv(key, v) })
++		}
++	}
++}
++
++func freeAddr(t *testing.T) string {
++	t.Helper()
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	addr := ln.Addr().String()
++	require.NoError(t, ln.Close())
++	return addr
++}
++
++func writeE2EConfig(t *testing.T, path string, cfg *server.Config) {
++	t.Helper()
++	data, err := json.MarshalIndent(cfg, "", "  ")
++	require.NoError(t, err)
++	require.NoError(t, os.WriteFile(path, data, 0o644))
++}
++
++func e2EBaseConfig(root, s3Addr, consoleAddr string) *server.Config {
++	cfg := server.DefaultConfig()
++	cfg.Root = root
++	cfg.Listen = s3Addr
++	cfg.ConsoleListen = consoleAddr
++	return cfg
++}
++
++// --- minimal SigV4 signer (GET, empty body), mirroring middleware.sigV4 ---
++
++const emptyPayloadSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
++
++func sigHMAC(key, data []byte) []byte {
++	h := hmac.New(sha256.New, key)
++	h.Write(data)
++	return h.Sum(nil)
++}
++
++func awsURIEncode(s string) string {
++	var b strings.Builder
++	for i := 0; i < len(s); i++ {
++		c := s[i]
++		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
++			c == '-' || c == '_' || c == '.' || c == '~' {
++			b.WriteByte(c)
++		} else {
++			fmt.Fprintf(&b, "%%%02X", c)
++		}
++	}
++	return b.String()
++}
++
++func canonicalQuery(rawQuery string) string {
++	if rawQuery == "" {
++		return ""
++	}
++	type kv struct{ k, v string }
++	var pairs []kv
++	for _, part := range strings.Split(rawQuery, "&") {
++		if part == "" {
++			continue
++		}
++		k, v, found := strings.Cut(part, "=")
++		if !found {
++			v = ""
++		}
++		kDec, _ := url.QueryUnescape(k)
++		vDec, _ := url.QueryUnescape(v)
++		pairs = append(pairs, kv{awsURIEncode(kDec), awsURIEncode(vDec)})
++	}
++	sort.Slice(pairs, func(i, j int) bool {
++		if pairs[i].k != pairs[j].k {
++			return pairs[i].k < pairs[j].k
++		}
++		return pairs[i].v < pairs[j].v
++	})
++	parts := make([]string, len(pairs))
++	for i, p := range pairs {
++		parts[i] = p.k + "=" + p.v
++	}
++	return strings.Join(parts, "&")
++}
++
++// newSigV4Request builds a GET request authenticated with keyID/secret.
++// With presign=false the signature travels in the Authorization header;
++// with presign=true it travels in X-Amz-* query parameters.
++func newSigV4Request(rawURL, keyID, secret string, presign bool) *http.Request {
++	const region, service = "us-east-1", "s3"
++	now := time.Now().UTC()
++	date := now.Format("20060102")
++	datetime := now.Format("20060102T150405Z")
++	scope := date + "/" + region + "/" + service + "/aws4_request"
++
++	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
++	if err != nil {
++		panic(err)
++	}
++	u := req.URL
++	payloadHash := emptyPayloadSHA256
++	rawQuery := ""
++	if presign {
++		q := u.Query()
++		q.Set("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
++		q.Set("X-Amz-Credential", keyID+"/"+scope)
++		q.Set("X-Amz-Date", datetime)
++		q.Set("X-Amz-Expires", "300")
++		q.Set("X-Amz-SignedHeaders", "host")
++		u.RawQuery = q.Encode()
++		rawQuery = u.RawQuery
++		payloadHash = "UNSIGNED-PAYLOAD"
++	}
++
++	canonReq := strings.Join([]string{
++		http.MethodGet,
++		u.Path,
++		canonicalQuery(rawQuery),
++		"host:" + u.Host,
++		"",
++		"host",
++		payloadHash,
++	}, "\n")
++	canonHash := sha256.Sum256([]byte(canonReq))
++	stringToSign := "AWS4-HMAC-SHA256\n" + datetime + "\n" + scope + "\n" +
++		hex.EncodeToString(canonHash[:])
++	kDate := sigHMAC([]byte("AWS4"+secret), []byte(date))
++	kRegion := sigHMAC(kDate, []byte(region))
++	kService := sigHMAC(kRegion, []byte(service))
++	kSigning := sigHMAC(kService, []byte("aws4_request"))
++	signature := hex.EncodeToString(sigHMAC(kSigning, []byte(stringToSign)))
++
++	if presign {
++		q := u.Query()
++		q.Set("X-Amz-Signature", signature)
++		u.RawQuery = q.Encode()
++	} else {
++		req.Header.Set("X-Amz-Date", datetime)
++		req.Header.Set("X-Amz-Content-Sha256", emptyPayloadSHA256)
++		req.Header.Set("Authorization",
++			fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=host, Signature=%s",
++				keyID, scope, signature))
++	}
++	return req
++}
++
++// reloadHTTPClient disables keep-alives so polled probes never leave idle
++// server connections behind; otherwise graceful Shutdown would have to
++// reap them on its own deadline during the SIGTERM phase of the test.
++var reloadHTTPClient = &http.Client{
++	Transport: &http.Transport{DisableKeepAlives: true},
++}
++
++func doStatus(req *http.Request) int {
++	resp, err := reloadHTTPClient.Do(req)
++	if err != nil {
++		return -1
++	}
++	_ = resp.Body.Close()
++	return resp.StatusCode
++}
++
++func requireStatusEventually(t *testing.T, want int, newReq func() *http.Request) {
++	t.Helper()
++	require.Eventually(t, func() bool {
++		return doStatus(newReq()) == want
++	}, 5*time.Second, 20*time.Millisecond)
++}
++
++func requireStatusConsistently(t *testing.T, want int, newReq func() *http.Request) {
++	t.Helper()
++	deadline := time.Now().Add(400 * time.Millisecond)
++	for time.Now().Before(deadline) {
++		require.Equal(t, want, doStatus(newReq()))
++		time.Sleep(20 * time.Millisecond)
++	}
++}
++
++func selfSignal(t *testing.T, sig syscall.Signal) {
++	t.Helper()
++	require.NoError(t, syscall.Kill(syscall.Getpid(), sig))
++}
++
++func TestRunSIGHUPReload(t *testing.T) {
++	clearReloadEnv(t)
++
++	// Hold the process's SIGHUP/SIGINT/SIGTERM notifications open for the
++	// whole test. Go resets a signal to its default (terminating)
++	// disposition when the last registration stops, and a signal landing
++	// inside that Stop window can therefore kill the test process even
++	// though Run consumed it. This independent registration keeps the
++	// signals "captured" until after Run has fully returned; it is stopped
++	// last because cleanups run in reverse registration order. It does not
++	// change Run's own delivery (signals are fanned out to every
++	// registered channel).
++	holdSignals := make(chan os.Signal, 64)
++	signal.Notify(holdSignals, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
++	t.Cleanup(func() { signal.Stop(holdSignals) })
++
++	root := t.TempDir()
++	configPath := filepath.Join(root, "s2.json")
++	s3Addr := freeAddr(t)
++	consoleAddr := freeAddr(t)
++	altAddr := freeAddr(t)
++
++	// Unique patterns; no handlers/s3api package is imported by this test
++	// binary, so the global registries start empty. Guarded by Once because
++	// the registries are process-global and the test may run more than once
++	// per binary (-count).
++	registerReloadProbesOnce.Do(func() {
++		probe := func(_ *server.Server, w http.ResponseWriter, _ *http.Request) {
++			w.WriteHeader(http.StatusOK)
++		}
++		server.RegisterS3HandleFunc("GET /{$}", middleware.SigV4(probe))
++		server.RegisterS3HandleFunc("GET /{bucket}/{key...}", middleware.SigV4(probe))
++		server.RegisterConsoleHandleFunc("GET /reload-probe", middleware.BasicAuth(probe))
++	})
++
++	readOnlyAnonymous := func() *server.Policy {
++		return &server.Policy{Version: "2012-10-17", Statement: []server.Statement{{
++			Effect:   "Allow",
++			Action:   []string{server.ActionGetObject},
++			Resource: []string{"arn:aws:s3:::*"},
++		}}}
++	}
++
++	// Generation 1: single legacy credential.
++	cfg := e2EBaseConfig(root, s3Addr, consoleAddr)
++	cfg.User, cfg.Password = "ak1", "sk1"
++	writeE2EConfig(t, configPath, cfg)
++
++	args := []string{"s2-server", "-f", configPath}
++	errCh := make(chan error, 1)
++	runDone := make(chan struct{})
++	go func() {
++		errCh <- server.Run(args)
++		close(runDone)
++	}()
++
++	// Fallback cleanup if an assertion fails before the explicit shutdown:
++	// terminate the still-running server and wait for it to fully exit.
++	t.Cleanup(func() {
++		select {
++		case <-runDone:
++			return
++		default:
++		}
++		_ = syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
++		select {
++		case <-runDone:
++		case <-time.After(10 * time.Second):
++		}
++	})
++
++	require.Eventually(t, func() bool {
++		conn, err := net.Dial("tcp", s3Addr)
++		if err != nil {
++			return false
++		}
++		_ = conn.Close()
++		conn, err = net.Dial("tcp", consoleAddr)
++		if err != nil {
++			return false
++		}
++		_ = conn.Close()
++		return true
++	}, 5*time.Second, 10*time.Millisecond)
++
++	s3ObjectURL := "http://" + s3Addr + "/bucket/key.txt"
++	consoleURL := "http://" + consoleAddr + "/reload-probe"
++	consoleReq := func(user, pass string) *http.Request {
++		req, err := http.NewRequest(http.MethodGet, consoleURL, nil)
++		require.NoError(t, err)
++		req.SetBasicAuth(user, pass)
++		return req
++	}
++
++	requireRunning := func(stage string) {
++		t.Helper()
++		select {
++		case err := <-errCh:
++			t.Fatalf("server exited during %s: %v", stage, err)
++		default:
++		}
++	}
++
++	// --- generation 1 expectations ---
++	require.Equal(t, http.StatusOK, doStatus(newSigV4Request(s3ObjectURL, "ak1", "sk1", false)))
++	require.Equal(t, http.StatusOK, doStatus(newSigV4Request(s3ObjectURL, "ak1", "sk1", true)))
++	require.Equal(t, http.StatusForbidden, doStatus(newSigV4Request(s3ObjectURL, "ak1", "wrong", false)))
++	require.Equal(t, http.StatusForbidden, doStatus(newSigV4Request(s3ObjectURL, "", "", false)))
++	require.Equal(t, http.StatusOK, doStatus(consoleReq("ak1", "sk1")))
++	require.Equal(t, http.StatusUnauthorized, doStatus(consoleReq("ak2", "sk2")))
++
++	// --- rotate: ak2 legacy, a multi-user entry, and anonymous read ---
++	cfg = e2EBaseConfig(root, s3Addr, consoleAddr)
++	cfg.User, cfg.Password = "ak2", "sk2"
++	cfg.Users = []server.User{
++		{AccessKeyID: "mk", SecretAccessKey: "mk-secret"},
++		{AccessKeyID: server.AnonymousAccessKeyID, Policy: readOnlyAnonymous()},
++	}
++	writeE2EConfig(t, configPath, cfg)
++	selfSignal(t, syscall.SIGHUP)
++
++	// New requests use the new generation: new secrets work everywhere.
++	requireStatusEventually(t, http.StatusOK, func() *http.Request {
++		return newSigV4Request(s3ObjectURL, "ak2", "sk2", false)
++	})
++	require.Equal(t, http.StatusOK, doStatus(newSigV4Request(s3ObjectURL, "ak2", "sk2", true)))
++	require.Equal(t, http.StatusOK, doStatus(newSigV4Request(s3ObjectURL, "mk", "mk-secret", false)))
++	require.Equal(t, http.StatusOK, doStatus(consoleReq("ak2", "sk2")))
++	require.Equal(t, http.StatusOK, doStatus(consoleReq("mk", "mk-secret")))
++	// Old generation's secret can no longer authenticate a new request,
++	// neither as a header signature nor as a presigned URL.
++	require.Equal(t, http.StatusForbidden, doStatus(newSigV4Request(s3ObjectURL, "ak1", "sk1", false)))
++	require.Equal(t, http.StatusForbidden, doStatus(newSigV4Request(s3ObjectURL, "ak1", "sk1", true)))
++	require.Equal(t, http.StatusUnauthorized, doStatus(consoleReq("ak1", "sk1")))
++	// The anonymous principal from the new generation serves unsigned S3
++	// requests, but can never be used to log into the console.
++	require.Equal(t, http.StatusOK, doStatus(mustGet(s3ObjectURL)))
++	require.Equal(t, http.StatusUnauthorized, doStatus(consoleReq(server.AnonymousAccessKeyID, "")))
++
++	// --- invalid file: the service keeps gen 2 ---
++	require.NoError(t, os.WriteFile(configPath, []byte(`{ "user": "ak-broken`), 0o644))
++	selfSignal(t, syscall.SIGHUP)
++	time.Sleep(300 * time.Millisecond) // let the failed reload settle
++	requireStatusConsistently(t, http.StatusOK, func() *http.Request {
++		return newSigV4Request(s3ObjectURL, "ak2", "sk2", false)
++	})
++	requireStatusConsistently(t, http.StatusOK, func() *http.Request { return mustGet(s3ObjectURL) })
++	requireRunning("invalid config reload")
++
++	// --- fix the file and reload: generation 3 recovers ---
++	cfg = e2EBaseConfig(root, s3Addr, consoleAddr)
++	cfg.User, cfg.Password = "ak3", "sk3"
++	writeE2EConfig(t, configPath, cfg)
++	selfSignal(t, syscall.SIGHUP)
++	requireStatusEventually(t, http.StatusOK, func() *http.Request {
++		return newSigV4Request(s3ObjectURL, "ak3", "sk3", false)
++	})
++	require.Equal(t, http.StatusForbidden, doStatus(newSigV4Request(s3ObjectURL, "ak2", "sk2", false)))
++	// Anonymous principal disappeared with generation 2.
++	require.Equal(t, http.StatusForbidden, doStatus(mustGet(s3ObjectURL)))
++
++	// --- immutable drift (listen) is rejected; old listener keeps serving ---
++	cfg = e2EBaseConfig(root, altAddr, consoleAddr)
++	cfg.User, cfg.Password = "ak3", "sk3"
++	writeE2EConfig(t, configPath, cfg)
++	selfSignal(t, syscall.SIGHUP)
++	time.Sleep(300 * time.Millisecond)
++	requireStatusConsistently(t, http.StatusOK, func() *http.Request {
++		return newSigV4Request(s3ObjectURL, "ak3", "sk3", false)
++	})
++	conn, err := net.DialTimeout("tcp", altAddr, 200*time.Millisecond)
++	require.Error(t, err)
++	if conn != nil {
++		_ = conn.Close()
++	}
++	requireRunning("immutable field drift reload")
++
++	// Recovery after a drift rejection.
++	cfg = e2EBaseConfig(root, s3Addr, consoleAddr)
++	cfg.User, cfg.Password = "ak4", "sk4"
++	writeE2EConfig(t, configPath, cfg)
++	selfSignal(t, syscall.SIGHUP)
++	requireStatusEventually(t, http.StatusOK, func() *http.Request {
++		return newSigV4Request(s3ObjectURL, "ak4", "sk4", false)
++	})
++
++	// --- SIGHUP burst: bounded coalescing, service stays up, converges ---
++	cfg = e2EBaseConfig(root, s3Addr, consoleAddr)
++	cfg.User, cfg.Password = "ak5", "sk5"
++	writeE2EConfig(t, configPath, cfg)
++	for i := 0; i < 50; i++ {
++		selfSignal(t, syscall.SIGHUP)
++	}
++	requireStatusEventually(t, http.StatusOK, func() *http.Request {
++		return newSigV4Request(s3ObjectURL, "ak5", "sk5", false)
++	})
++	require.Equal(t, http.StatusOK, doStatus(mustGet("http://"+s3Addr+"/healthz")))
++	requireRunning("SIGHUP burst")
++
++	// --- disabling auth by removing all credentials also reloads ---
++	cfg = e2EBaseConfig(root, s3Addr, consoleAddr)
++	writeE2EConfig(t, configPath, cfg)
++	selfSignal(t, syscall.SIGHUP)
++	requireStatusEventually(t, http.StatusOK, func() *http.Request { return mustGet(s3ObjectURL) })
++	require.Equal(t, http.StatusOK, doStatus(mustGet(consoleURL)))
++	requireRunning("auth-disabled reload")
++
++	// --- SIGHUPs interleaved with SIGTERM converge into graceful shutdown ---
++	cfg = e2EBaseConfig(root, s3Addr, consoleAddr)
++	cfg.User, cfg.Password = "ak6", "sk6"
++	writeE2EConfig(t, configPath, cfg)
++	for i := 0; i < 20; i++ {
++		selfSignal(t, syscall.SIGHUP)
++	}
++	selfSignal(t, syscall.SIGTERM)
++	select {
++	case err := <-errCh:
++		require.NoError(t, err)
++	case <-time.After(15 * time.Second):
++		t.Fatal("Run did not return after SIGTERM interleaved with SIGHUPs")
++	}
++	require.Eventually(t, func() bool {
++		c, dialErr := net.DialTimeout("tcp", s3Addr, 200*time.Millisecond)
++		if c != nil {
++			_ = c.Close()
++		}
++		return dialErr != nil
++	}, 3*time.Second, 20*time.Millisecond)
++}
++
++func mustGet(rawURL string) *http.Request {
++	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
++	if err != nil {
++		panic(err)
++	}
++	return req
++}
+diff --git a/server/server.go b/server/server.go
+index 596648c..08f885e 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -122,25 +122,10 @@ func Run(args []string) error {
+ 		return nil
+ 	}
+ 
+-	cfg := DefaultConfig()
+-	if f.configFile != "" {
+-		if err := cfg.LoadFile(f.configFile); err != nil {
+-			return err
+-		}
+-	}
+-	if err := cfg.LoadEnv(); err != nil {
++	cfg, err := buildConfig(f)
++	if err != nil {
+ 		return err
+ 	}
+-	// Flags have the highest precedence: default < file < env < flag.
+-	if f.listen != nil {
+-		cfg.Listen = *f.listen
+-	}
+-	if f.root != nil {
+-		cfg.Root = *f.root
+-	}
+-	if f.buckets != nil {
+-		cfg.Buckets = splitBucketList(*f.buckets)
+-	}
+ 
+ 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+ 	defer stop()
+@@ -159,13 +144,60 @@ func Run(args []string) error {
+ 		slog.Info("Created initial bucket", "name", name)
+ 	}
+ 
+-	slog.Info("Listening", "addr", cfg.Listen)
+-	return srv.Start(ctx)
++	// SIGHUP reloads are only available when a config file was supplied;
++	// newReloadSignals returns nil otherwise, leaving the behavior of
++	// file-less deployments unchanged.
++	hupCh := newReloadSignals(f.configFile)
++	if hupCh != nil {
++		defer signal.Stop(hupCh)
++	}
++
++	slog.Info("Listening", "addr", cfg.Listen, "generation", srv.ConfigGeneration())
++
++	errCh := make(chan error, 1)
++	go func() {
++		errCh <- srv.Start(ctx)
++	}()
++
++	for {
++		select {
++		case err := <-errCh:
++			// A listener died; Start already shut the others down.
++			return err
++		case <-ctx.Done():
++			// SIGINT/SIGTERM: wait only for graceful shutdown. A SIGHUP
++			// that races with shutdown is ignored rather than starting a
++			// pointless last reload; reloads never touch the shutdown
++			// path, so a reload already in progress cannot delay this.
++			return <-errCh
++		case <-hupCh:
++			if ctx.Err() != nil {
++				return <-errCh
++			}
++			// Coalesce a SIGHUP already queued behind this one. This pass
++			// re-reads the file anyway; any signal that arrives while the
++			// reload runs remains buffered and is handled on the next
++			// iteration. The buffer size of 1 plus the runtime's
++			// non-blocking delivery bounds bursts: no per-signal
++			// goroutine is ever started.
++			select {
++			case <-hupCh:
++			default:
++			}
++			srv.reloadAndLog(f)
++		}
++	}
+ }
+ 
+ // Server is a web server that provides a Web Console and S3-compatible API for S2.
+ type Server struct {
++	// Config is the configuration the server was started with. Runtime
++	// fields are immutable by construction (a reload rejects candidates
++	// that drift), so listeners, storage, and templates can read it
++	// directly. Request-time authentication must use CurrentConfig to
++	// observe the generation published by the latest SIGHUP reload.
+ 	Config    *Config
++	configs   *configStore
+ 	Template  *template.Template
+ 	Buckets   *Buckets
+ 	Multipart *MultipartStore
+@@ -191,6 +223,7 @@ func NewServer(ctx context.Context, cfg *Config) (*Server, error) {
+ 	}
+ 	return &Server{
+ 		Config:    cfg,
++		configs:   newConfigStore(cfg),
+ 		Template:  tmpl,
+ 		Buckets:   buckets,
+ 		Multipart: multipart,

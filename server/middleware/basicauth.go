@@ -25,12 +25,17 @@ import (
 // requires a real credential.
 func BasicAuth(next server.HandlerFunc) server.HandlerFunc {
 	return func(srv *server.Server, w http.ResponseWriter, r *http.Request) {
-		if !srv.Config.AuthEnabled() {
+		// Snapshot one configuration generation per request, matching
+		// SigV4: the credential comparison and the policy decision must
+		// come from the same User of the same generation, never a mix of
+		// a pre- and post-SIGHUP configuration.
+		cfg := srv.CurrentConfig()
+		if !cfg.AuthEnabled() {
 			next(srv, w, r)
 			return
 		}
 		user, pass, ok := r.BasicAuth()
-		u := srv.Config.LookupUser(user)
+		u := cfg.LookupUser(user)
 		if !ok || u == nil || u.AccessKeyID == server.AnonymousAccessKeyID || subtle.ConstantTimeCompare([]byte(pass), []byte(u.SecretAccessKey)) != 1 {
 			w.Header().Set("WWW-Authenticate", `Basic realm="s2"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)

@@ -39,13 +39,20 @@ const (
 // then checked exactly like any other matched User's.
 func SigV4(next server.HandlerFunc) server.HandlerFunc {
 	return func(srv *server.Server, w http.ResponseWriter, r *http.Request) {
-		if !srv.Config.AuthEnabled() {
+		// Take one immutable configuration snapshot for the whole request.
+		// The Authorization-header, presigned-query, anonymous fallback,
+		// and policy checks below must all resolve principals, secrets,
+		// and policies from this same generation: a SIGHUP publish that
+		// lands while this request is in flight cannot make the signature
+		// check use an old secret and the policy check a new principal.
+		cfg := srv.CurrentConfig()
+		if !cfg.AuthEnabled() {
 			next(srv, w, r)
 			return
 		}
 
 		lookup := func(accessKeyID string) (*server.User, bool) {
-			u := srv.Config.LookupUser(accessKeyID)
+			u := cfg.LookupUser(accessKeyID)
 			return u, u != nil
 		}
 

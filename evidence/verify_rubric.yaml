@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: p2p
+    text: 未发送 SIGHUP、没有配置文件或未启用认证时，S3 API、Web Console、监听与关闭行为保持固定版本兼容。
+  - id: 2
+    type: f2p
+    text: 合法配置经 SIGHUP 重载后，新 credential 和 policy 对 S3 SigV4 与 Web Console BasicAuth 同一批生效，旧 credential 只对重载前已进入认证的请求有效，后续请求会被拒绝。
+  - id: 3
+    type: f2p
+    text: 配置文件缺失、JSON 或 policy 无效、access key 重复以及不可变字段漂移都会拒绝整次重载并完整保留旧 generation；修复来源后下一次 SIGHUP 能成功恢复。
+  - id: 4
+    type: f2p
+    text: 重载与请求并发时，每个请求只使用旧或新的一份完整认证 generation，secret、matched principal 与 policy 不会跨 generation 混用。
+  - id: 5
+    type: f2p
+    text: 重载候选按照 default、配置文件、环境变量和显式 flags 的启动优先级重建并经过完整校验，只有认证字段变化且其他运行资源字段不变时才会发布。
+  - id: 6
+    type: f2p
+    text: 连续 SIGHUP 与 SIGINT 或 SIGTERM 交错时，重载有界收敛且优雅关闭仍能完成，不泄漏信号处理或重载协程，也不发布半份配置；成功与失败均有可区分日志。
+  - id: 7
+    type: p2p
+    text: Authorization header、query presign、匿名 principal、IAM allow/deny、legacy credential、Console BasicAuth 和既有配置优先级测试保持兼容。
